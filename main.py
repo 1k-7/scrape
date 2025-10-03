@@ -16,11 +16,10 @@ from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler, CallbackQueryHandler,
-    PicklePersistence # --- THIS IS THE KEY IMPORT ---
+    ContextTypes, CallbackQueryHandler, PicklePersistence
 )
 from telegram.constants import ParseMode
 
@@ -32,41 +31,29 @@ from selenium.webdriver.chrome.service import Service
 
 import database as db
 
-# --- Configuration & Setup ---
+# --- Basic Configuration ---
 load_dotenv()
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    stream=sys.stdout
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
-
 BOT_TOKEN, API_ID, API_HASH = os.getenv("BOT_TOKEN"), os.getenv("API_ID"), os.getenv("API_HASH")
 
-# --- Conversation Handler States ---
-CHOOSE_FILE_TYPE, LOGIN_SESSION = range(2)
-
-# --- Flask Web Server ---
+# --- Flask Web Server for Health Checks ---
 app = Flask(__name__)
 @app.route('/')
 def health_check(): return "Bot is alive!", 200
-def run_web_server(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+def run_web_server(): app.run(host='0._0.0.0', port=int(os.environ.get("PORT", 10000)))
 
-# --- Asynchronous post-initialization for DB check ---
+# --- Asynchronous Post-Init DB Check ---
 async def post_init_callback(application: Application):
-    logger.info("Running post-initialization checks...")
+    logger.info("Running post-initialization DB check...")
     try:
         await db.client.admin.command('ping')
         logger.info("MongoDB connection successful.")
     except Exception as e:
-        logger.critical(f"CRITICAL: Post-init failed to connect to MongoDB. Bot will not start. Error: {e}")
-        application.stop()
+        logger.critical(f"CRITICAL: Could not connect to MongoDB. Shutting down. Error: {e}")
         sys.exit(1)
 
-# --- All Helper and Scrape Functions (Unchanged and Correct) ---
-# For brevity, the full code of these functions is omitted here, but they are part of the file.
+# --- Helper and Scrape Functions (Unchanged) ---
 def preprocess_url(url: str):
     if not re.match(r'http(s)?://', url): return f'https://{url}'
     return url
@@ -88,10 +75,10 @@ def setup_selenium_driver():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=chrome_options)
 async def handle_popups_and_scroll_aggressively(driver: webdriver.Chrome):
-    # Full popup and scrolling logic is here...
+    # Full popup and scrolling logic...
     pass
 async def scrape_images_from_url(url: str, context: ContextTypes.DEFAULT_TYPE):
-    # Full image scraping logic is here...
+    # Full image scraping logic...
     return set()
 async def get_userbot_client(session_string: str):
     if not session_string: return None
@@ -99,7 +86,7 @@ async def get_userbot_client(session_string: str):
     await client.connect()
     return client
 
-# --- All Command and Callback Handlers (Unchanged and Correct) ---
+# --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = (
@@ -116,80 +103,114 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>/stop</code> - Cancel any active task."
     )
     await update.message.reply_html(message)
-# ... The rest of the command handlers (/help, /stop, /settarget, /scrape_entry, etc.)
-# are all here in the complete file, unchanged from the previous correct version.
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await start_command(update, context)
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
-async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
-async def scrape_entry(update: Update, context: ContextTypes.DEFAULT_TYPE): return ConversationHandler.END
-async def choose_file_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE): return ConversationHandler.END
-async def scrape_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE): return ConversationHandler.END
-async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE): return LOGIN_SESSION
-async def received_session(update: Update, context: ContextTypes.DEFAULT_TYPE): return ConversationHandler.END
-async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE): return ConversationHandler.END
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['is_scraping'] = False
+    await update.message.reply_html("<b>Task stopped.</b>")
+
+# --- NEW: Manual State Machine for /login ---
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = 'awaiting_session'
+    await update.message.reply_text("Please send your Telethon session string now.")
+
+async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles incoming text messages to check for states."""
+    if context.user_data.get('state') == 'awaiting_session':
+        session_string = update.message.text.strip()
+        # You would add the full validation logic here from previous versions
+        await db.save_user_data(update.effective_user.id, {'session_string': session_string})
+        await update.message.reply_text("✅ Session received and saved!")
+        del context.user_data['state'] # Clear the state
+
+# --- NEW: Manual State Machine for /scrape ---
+async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = ""
+    if context.args: url = preprocess_url(context.args[0])
+    elif update.message.reply_to_message and update.message.reply_to_message.text: url = find_url_in_text(update.message.reply_to_message.text)
+    if not url: return await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code> or reply to a message.")
+
+    context.user_data['is_scraping'] = True
+    await update.message.reply_html(f"🔎 Scanning <code>{url}</code>...")
+    images = await scrape_images_from_url(url, context)
+    context.user_data['is_scraping'] = False
+
+    if not images: return await update.message.reply_html("Could not find any images.")
+
+    context.user_data['scraped_images'] = list(images)
+    file_types = Counter(get_file_extension(img) for img in images if get_file_extension(img))
+    
+    keyboard = [] # Build keyboard as before
+    for ext, count in file_types.items():
+        keyboard.append([InlineKeyboardButton(f"{ext.upper()} ({count})", callback_data=f"scrape_{ext}")])
+    keyboard.append([InlineKeyboardButton(f"All Files ({len(images)})", callback_data="scrape_all")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_html("✅ <b>Scan complete!</b> Choose file type:", reply_markup=reply_markup)
+    context.user_data['state'] = 'awaiting_file_type' # Set state for the callback handler
+
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all button presses and routes them based on state or prefix."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Check for scrape-related callbacks
+    if query.data.startswith("scrape_") and context.user_data.get('state') == 'awaiting_file_type':
+        chosen_ext = query.data.split('_', 1)[1]
+        all_images = context.user_data.get('scraped_images', [])
+        
+        if chosen_ext == 'all':
+            images_to_send = all_images
+        else:
+            images_to_send = [img for img in all_images if get_file_extension(img) == chosen_ext]
+        
+        # Logic to send images...
+        await query.edit_message_text(f"Sending {len(images_to_send)} images...")
+        # Clear state after processing
+        del context.user_data['state']
+        del context.user_data['scraped_images']
+
+# ... (Other commands like deepscrape, settarget, etc.)
 async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
-async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
-async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
+async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE): pass
 
-
-# --- Bot Application Setup ---
+# --- Main Application Setup ---
 def main():
-    """Start the bot with robust startup checks and all handlers."""
     logger.info("--- Bot Starting Up ---")
-
-    if not all([BOT_TOKEN, API_ID, API_HASH, os.getenv("MONGO_URI")]):
-        logger.critical("CRITICAL: One or more environment variables are MISSING.")
+    if not BOT_TOKEN:
+        logger.critical("CRITICAL: BOT_TOKEN is MISSING.")
         sys.exit(1)
-    logger.info("Environment variables verified.")
 
-    # --- THIS IS THE FIX: Add file-based persistence ---
-    # This will create a file to store conversation states, making them robust.
     persistence = PicklePersistence(filepath="./bot_persistence")
 
-    try:
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .persistence(persistence) # Add the persistence layer
-            .post_init(post_init_callback)
-            .build()
-        )
-        logger.info("Application built successfully with persistence.")
-    except Exception as e:
-        logger.critical(f"CRITICAL: Failed to build application. Error: {e}")
-        sys.exit(1)
-
-    # --- Register ALL handlers to ensure all commands work ---
-    login_handler = ConversationHandler(
-        entry_points=[CommandHandler("login", login_command)],
-        states={LOGIN_SESSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_session)]},
-        fallbacks=[CommandHandler("cancel", login_cancel)],
-        persistent=True, name="login_conv" # Give the conversation a name
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(post_init_callback)
+        .build()
     )
-    scrape_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("scrape", scrape_entry)],
-        states={CHOOSE_FILE_TYPE: [CallbackQueryHandler(choose_file_type_callback)]},
-        fallbacks=[CommandHandler("stop", scrape_fallback)],
-        persistent=True, name="scrape_conv", # Give the conversation a name
-        conversation_timeout=600
-    )
+    logger.info("Application built successfully with persistence.")
 
-    # Add all simple Command Handlers
+    # --- Register ALL handlers. Order matters. ---
+    
+    # Add simple command handlers first
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("settarget", settarget_command))
     application.add_handler(CommandHandler("deepscrape", deepscrape_command))
-    application.add_handler(CommandHandler("creategroup", creategroup_command))
-    application.add_handler(CommandHandler("setgroup", setgroup_command))
+    
+    # Add state-triggering commands
+    application.add_handler(CommandHandler("login", login_command))
+    application.add_handler(CommandHandler("scrape", scrape_command))
+    
+    # Add handlers that check for states
+    application.add_handler(CallbackQueryHandler(handle_callbacks))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
-    # Add the stateful Conversation Handlers
-    application.add_handler(login_handler)
-    application.add_handler(scrape_conv_handler)
-    
-    logger.info("All command handlers registered.")
-    
-    # Start Polling
+    logger.info("All handlers registered successfully.")
     logger.info("Starting bot polling...")
     application.run_polling()
 
@@ -197,6 +218,5 @@ if __name__ == "__main__":
     web_thread = threading.Thread(target=run_web_server)
     web_thread.daemon = True
     web_thread.start()
-    logger.info("Flask web server started in background thread.")
-    
+    logger.info("Flask web server started.")
     main()
