@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB_NAME]
 users_collection = db["users"]
-tasks_collection = db["tasks"] # New collection for stateful tasks
+tasks_collection = db["tasks"]
 logger.info("Successfully connected to MongoDB.")
 
 
@@ -31,7 +31,7 @@ async def save_user_data(user_id: int, data_to_update: dict):
         upsert=True
     )
 
-# --- NEW: Task Management Functions ---
+# --- Task Management Functions ---
 async def create_task(user_id: int, base_url: str, all_links: list) -> str:
     """Creates a new deepscrape task document in the database."""
     task = {
@@ -49,9 +49,10 @@ async def create_task(user_id: int, base_url: str, all_links: list) -> str:
     result = await tasks_collection.insert_one(task)
     return result.inserted_id
 
-async def get_user_task(user_id: int, status: str = "paused"):
-    """Finds a user's incomplete task."""
-    return await tasks_collection.find_one({"user_id": user_id, "status": status})
+async def get_user_active_task(user_id: int):
+    """Finds a user's active (running or paused) task."""
+    return await tasks_collection.find_one({"user_id": user_id, "status": {"$in": ["running", "paused"]}})
+
 
 async def update_task_progress(task_id, link: str, images: list):
     """Updates the current link and its scraped images."""
