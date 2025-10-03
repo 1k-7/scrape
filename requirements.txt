@@ -1,10 +1,25 @@
+# Python libraries required to run the Telegram Image Scraper Bot
+
+# For the Telegram bot interface
 python-telegram-bot
+
+# For web scraping and parsing HTML
 beautifulsoup4
 requests
+
+# For interacting with the Telegram API as a user (userbot)
 telethon
+
+# For browser automation to handle JavaScript-heavy sites
 selenium
 webdriver-manager
+
+# For managing environment variables
 python-dotenv
+
+# For asynchronous interaction with MongoDB
 motor
 pymongo
+
+# Often required for MongoDB Atlas SRV connection strings
 dnspython
