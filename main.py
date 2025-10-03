@@ -49,10 +49,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING) # Quiets the Flask startup messages
 logger = logging.getLogger(__name__)
 
-# --- NEW: Flask Web Server Setup ---
-# This will run in the background to keep the Render Web Service healthy.
+# --- Flask Web Server Setup ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -62,7 +62,6 @@ def health_check():
 
 def run_web_server():
     """Runs the Flask app in a separate thread."""
-    # Render provides the PORT environment variable.
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
@@ -87,14 +86,10 @@ def setup_selenium_driver():
     driver.set_page_load_timeout(45)
     return driver
 
-# --- MODIFIED: Heavily Upgraded Smart Scraping Logic ---
+# --- Smart Scraping Logic ---
 async def handle_popups_and_scroll_aggressively(driver: webdriver.Chrome):
-    """
-    More robustly handles popups using JavaScript and scrolls until no new images are found.
-    """
-    # 1. Brute-force click popups using JavaScript
     logger.info("Searching for popups to click...")
-    popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes']
+    popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes', 'i agree']
     js_script = f"""
     var keywords = {popup_keywords};
     var buttons = document.querySelectorAll('button, a, div, span');
@@ -114,34 +109,28 @@ async def handle_popups_and_scroll_aggressively(driver: webdriver.Chrome):
     return clicked;
     """
     try:
-        clicked = driver.execute_script(js_script)
-        if clicked:
+        if driver.execute_script(js_script):
             logger.info("Successfully clicked a popup element via JavaScript.")
-            await asyncio.sleep(3)  # Wait for popup to disappear
+            await asyncio.sleep(3)
     except Exception as e:
         logger.warning(f"Could not execute popup click script: {e}")
 
-    # 2. Advanced scrolling based on image count
     logger.info("Starting advanced scrolling...")
     scroll_pause_time = 2.5
     last_image_count = 0
     stable_count = 0
 
-    while stable_count < 3: # Stop after 3 consecutive scrolls with no new images
+    while stable_count < 3:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         await asyncio.sleep(scroll_pause_time)
-        
-        # Check current number of image sources found
         current_images = driver.find_elements(By.TAG_NAME, "img")
         current_image_count = len([img for img in current_images if img.get_attribute('src')])
-
         if current_image_count == last_image_count:
             stable_count += 1
-            logger.info(f"Image count is stable at {current_image_count}. Stability: {stable_count}/3")
+            logger.info(f"Image count stable: {stable_count}/3")
         else:
-            stable_count = 0 # Reset counter if new images were loaded
+            stable_count = 0
             logger.info(f"Image count increased from {last_image_count} to {current_image_count}.")
-        
         last_image_count = current_image_count
 
 async def scrape_images_from_url(url: str) -> set:
@@ -152,36 +141,26 @@ async def scrape_images_from_url(url: str) -> set:
     try:
         driver.get(url)
         await handle_popups_and_scroll_aggressively(driver)
-        
         soup = BeautifulSoup(driver.page_source, "html.parser")
-
-        # More comprehensive search for images
-        # 1. Standard <img> tags
         for img in soup.find_all("img"):
             src = img.get("src") or img.get("data-src")
-            if src and src.strip():
-                images.add(urljoin(url, src.strip()))
-        
-        # 2. Images in <picture><source> tags
+            if src and src.strip(): images.add(urljoin(url, src.strip()))
         for pic in soup.find_all("picture"):
             for source in pic.find_all("source"):
                 srcset = source.get("srcset")
                 if srcset and srcset.strip():
-                    # Take the first URL from srcset
                     first_url = srcset.strip().split(',')[0].split(' ')[0]
                     images.add(urljoin(url, first_url))
-
     except Exception as e:
-        logger.error(f"An error occurred while scraping {url}: {e}", exc_info=True)
+        logger.error(f"Error scraping {url}: {e}", exc_info=True)
     finally:
         driver.quit()
     
-    # Final filter for valid URLs
     valid_images = {img for img in images if is_valid_url(img)}
     logger.info(f"Found {len(valid_images)} valid images on {url}")
     return valid_images
 
-# (The rest of the file - command handlers, userbot logic, etc. - remains the same as before)
+# --- Userbot and Bot Command Handlers ---
 async def get_userbot_client(session_string: str) -> TelegramClient:
     if not session_string: return None
     client = TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
@@ -201,10 +180,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - Show this message."
     )
 
+# --- THIS IS THE FIX ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the help message by reusing the start_command logic."""
+    await start_command(update, context)
+
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Please send me your Telethon session string.\nRun `generate_session.py` locally to get it.\n\nSend /cancel to abort."
-    )
+    await update.message.reply_text("Please send your Telethon session string.\nSend /cancel to abort.")
     return SESSION_STRING
 
 async def received_session_string(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -214,21 +196,20 @@ async def received_session_string(update: Update, context: ContextTypes.DEFAULT_
     try:
         client = await get_userbot_client(session_string)
         if not client or not await client.is_user_authorized():
-            await update.message.reply_text("Login failed. The session string seems invalid.")
+            await update.message.reply_text("Login failed. Invalid session.")
             if client: await client.disconnect()
             return ConversationHandler.END
         me = await client.get_me()
         await db.save_user_data(user_id, {'session_string': session_string})
-        await update.message.reply_text(f"✅ Successfully logged in as {me.first_name}! Your session is saved.")
+        await update.message.reply_text(f"✅ Logged in as {me.first_name}! Session saved.")
         await client.disconnect()
     except Exception as e:
-        logger.error(f"Session validation failed for user {user_id}: {e}")
         await update.message.reply_text(f"An error occurred: {e}.")
         return ConversationHandler.END
     return ConversationHandler.END
 
 async def cancel_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Login process cancelled.")
+    await update.message.reply_text("Login cancelled.")
     return ConversationHandler.END
 
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,7 +249,7 @@ async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         full_channel = await user_client(functions.channels.GetFullChannelRequest(channel=chat_id))
         supergroup_id = int(f"-100{full_channel.full_chat.id}")
         await db.save_user_data(user_id, {'target_group_id': supergroup_id})
-        await update.message.reply_text(f"✅ Successfully created '{group_name}'!\nID: `{supergroup_id}`\nIt's now your target group.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Created '{group_name}'!\nID: `{supergroup_id}`\nIt's now your target group.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {e}")
     finally:
@@ -312,9 +293,7 @@ async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         if user_client: await user_client.disconnect()
 
-
 def run_bot():
-    """Sets up and runs the Telegram bot."""
     if not all([BOT_TOKEN, API_ID, API_HASH, db.MONGO_URI]):
         logger.critical("One or more environment variables are missing.")
         return
@@ -327,7 +306,7 @@ def run_bot():
     )
     application.add_handler(login_handler)
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("help", help_command)) # This line now works
     application.add_handler(CommandHandler("scrape", scrape_command))
     application.add_handler(CommandHandler("setgroup", setgroup_command))
     application.add_handler(CommandHandler("creategroup", creategroup_command))
@@ -337,10 +316,7 @@ def run_bot():
     application.run_polling()
 
 if __name__ == "__main__":
-    # --- MODIFIED: Start the web server in a background thread ---
     web_thread = threading.Thread(target=run_web_server)
     web_thread.daemon = True
     web_thread.start()
-    
-    # Start the bot in the main thread
     run_bot()
