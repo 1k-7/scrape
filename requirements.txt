@@ -1,7 +1,10 @@
 python-telegram-bot
 beautifulsoup4
 requests
-telethon
-selenium
+​telethon
+​selenium
 webdriver-manager
-python-dotenv
+​python-dotenv
+​motor
+pymongo
+​dnspython
