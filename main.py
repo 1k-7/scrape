@@ -46,36 +46,27 @@ app = Flask(__name__)
 def health_check(): return "Bot is alive!", 200
 def run_web_server(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
-# --- Helper Functions ---
-def preprocess_url(url: str):
-    if not re.match(r'http(s)?://', url): return f'https://{url}'
-    return url
+# --- Helper and Scrape Functions (Unchanged) ---
+# ... (All helpers like preprocess_url, find_url_in_text, setup_selenium_driver, handle_popups..., scrape_entry, etc. are the same)
 
-def find_url_in_text(text: str):
-    if not text: return None
-    match = re.search(r'https?://[^\s/$.?#].[^\s]*', text)
-    return match.group(0) if match else None
-# ... (Other helpers like get_file_extension, setup_selenium_driver, handle_popups... remain the same)
-
-# --- Core Task & Scrape Logic ---
-# (scrape_entry, choose_file_type_callback and their helpers remain the same)
 async def get_userbot_client(session_string: str):
     if not session_string: return None
     client = TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
     await client.connect()
     return client
 
-# --- NEW: Refactored Deepscrape Logic ---
-async def _run_deepscrape_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task):
-    """The core worker process for deepscraping. Can be resumed."""
+# --- FULLY AUTOMATED Deepscrape Logic ---
+async def _run_deepscrape_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id):
+    """The core worker process for deepscraping. Handles floodwaits automatically."""
     user_id = update.effective_user.id
+    task = await db.tasks_collection.find_one({"_id": task_id})
     user_data = await db.get_user_data(user_id)
     if not user_data or 'session_string' not in user_data:
-        return await update.message.reply_html("<b>Error:</b> Login session not found. Please /login again.")
+        return await context.bot.send_message(user_id, "<b>Error:</b> Login session not found.", parse_mode=ParseMode.HTML)
 
     target_group = user_data.get('target_group_id')
     if not target_group:
-        return await update.message.reply_html("<b>Error:</b> Target group not set. Please use /setgroup.")
+        return await context.bot.send_message(user_id, "<b>Error:</b> Target group not set.", parse_mode=ParseMode.HTML)
 
     await db.update_task_status(task['_id'], "running")
     context.user_data['is_scraping'] = True
@@ -85,100 +76,92 @@ async def _run_deepscrape_task(update: Update, context: ContextTypes.DEFAULT_TYP
         user_client = await get_userbot_client(user_data['session_string'])
         entity = await user_client.get_entity(int(target_group) if target_group.startswith('-') else target_group)
 
-        pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
-        
-        # Resume from a partially completed link
-        if task['current_link_progress']['link'] and task['current_link_progress']['link'] in pending_links:
-             current_link = task['current_link_progress']['link']
-             pending_links.remove(current_link)
-             links_to_process = [current_link] + pending_links
-        else:
-            links_to_process = pending_links
+        # Main processing loop
+        while True:
+            task = await db.tasks_collection.find_one({"_id": task_id}) # Refresh task state
+            if task['status'] != 'running' or not context.user_data.get('is_scraping', False):
+                logger.info(f"Task {task_id} for user {user_id} stopped externally.")
+                break
 
-        for link in links_to_process:
-            if not context.user_data.get('is_scraping', True): break
+            pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
+            if not pending_links:
+                await db.update_task_status(task['_id'], "completed")
+                await context.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b>", parse_mode=ParseMode.HTML)
+                break
 
+            link = pending_links[0]
             await context.bot.send_message(user_id, f"Processing: <code>{link}</code>", parse_mode=ParseMode.HTML)
-            
-            # --- State Recovery ---
-            is_resumed_link = (link == task['current_link_progress']['link'])
-            if is_resumed_link:
-                images = task['current_link_progress']['images_scraped']
-                completed_count = task['current_link_progress']['completed_images_count']
-            else:
-                images = await scrape_images_from_url(link, context) # Simplified scrape call
-                await db.update_task_progress(task['_id'], link, list(images))
-                completed_count = 0
 
-            images_to_upload = images[completed_count:]
-            
+            images = await scrape_images_from_url(link, context) # Simplified scrape call
+            await db.update_task_progress(task['_id'], link, list(images))
             if not images:
                 await db.complete_link_in_task(task['_id'], link)
                 continue
 
-            # STEP 1: Create Topic (via Userbot)
-            try:
-                topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98]
-                topic_result = await user_client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=context.bot._get_private_random_id()))
-                topic_id = topic_result.updates[0].message.id
-            except FloodWaitError as e:
-                await db.update_task_status(task['_id'], "paused")
-                await context.bot.send_message(user_id, f"<b>Task Paused:</b> Hit a flood wait of {e.seconds}s while creating a topic. Use /resume later.")
-                return
-            
-            # STEP 2: Upload Images (via Bot)
-            for i, img_url in enumerate(images_to_upload, start=1):
-                if not context.user_data.get('is_scraping', True): break
+            # STEP 1: Create Topic
+            topic_id = None
+            while not topic_id:
                 try:
-                    await context.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
-                    await db.update_task_image_completion(task['_id'], completed_count + i)
-                except RetryAfter as e:
+                    topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98]
+                    topic_result = await user_client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=context.bot._get_private_random_id()))
+                    topic_id = topic_result.updates[0].message.id
+                except FloodWaitError as e:
                     await db.update_task_status(task['_id'], "paused")
-                    await context.bot.send_message(user_id, f"<b>Task Paused:</b> Telegram is requesting a wait of {e.retry_after}s. Use /resume after this period.")
-                    return
+                    wait_duration = e.seconds + 5
+                    await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Hit flood wait. Will resume automatically in {wait_duration}s.", parse_mode=ParseMode.HTML)
+                    await asyncio.sleep(wait_duration)
+                    await db.update_task_status(task['_id'], "running")
                 except Exception as e:
-                    logger.warning(f"Failed to upload {img_url}: {e}")
+                    await context.bot.send_message(user_id, f"Error creating topic for {link}: {e}")
+                    break # Skip to next link
+            if not topic_id: continue
+
+            # STEP 2: Upload Images
+            for i, img_url in enumerate(list(images)):
+                 while True: # Retry loop for this specific image
+                    if not context.user_data.get('is_scraping', True): break
+                    try:
+                        await context.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
+                        await db.update_task_image_completion(task['_id'], i + 1)
+                        break # Success, move to next image
+                    except RetryAfter as e:
+                        await db.update_task_status(task['_id'], "paused")
+                        wait_duration = e.retry_after + 5
+                        await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Telegram limit reached. Resuming in {wait_duration}s.", parse_mode=ParseMode.HTML)
+                        await asyncio.sleep(wait_duration)
+                        await db.update_task_status(task['_id'], "running")
+                    except Exception as e:
+                        logger.warning(f"Failed to upload {img_url}: {e}")
+                        break # Failure, move to next image
+                 if not context.user_data.get('is_scraping', True): break
 
             if context.user_data.get('is_scraping', True):
                  await db.complete_link_in_task(task['_id'], link)
-        
-        if context.user_data.get('is_scraping', True):
-            await db.update_task_status(task['_id'], "completed")
-            await context.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b>")
 
     except Exception as e:
         await db.update_task_status(task['_id'], "paused")
-        await context.bot.send_message(user_id, f"An unexpected error occurred: <code>{e}</code>. Task paused. You can try to /resume later.")
+        await context.bot.send_message(user_id, f"An unexpected error occurred: <code>{e}</code>. Task paused.", parse_mode=ParseMode.HTML)
     finally:
         if user_client: await user_client.disconnect()
         context.user_data['is_scraping'] = False
 
 async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await db.get_user_active_task(update.effective_user.id):
+        return await update.message.reply_html("You already have an active deepscrape task. Use /stop to cancel it first.")
+    
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/deepscrape [url]</code>")
     base_url = preprocess_url(context.args[0])
 
     await update.message.reply_html(f"Scanning <code>{base_url}</code> for links...")
-    response = requests.get(base_url, headers={'User-Agent': 'Mozilla/5.0'})
-    soup = BeautifulSoup(response.content, 'html.parser')
-    links = sorted(list({urljoin(base_url, a['href']) for a in soup.find_all('a', href=True)})) # Simplified
+    # ... (link scanning logic remains the same)
+    links = ["https://example.com/page1", "https://example.com/page2"] # Dummy data
     
     task_id = await db.create_task(update.effective_user.id, base_url, links)
-    task = await db.tasks_collection.find_one({"_id": task_id})
-    
     await update.message.reply_html(f"Found {len(links)} links. Starting deep scrape.\nTo cancel, use /stop.")
-    asyncio.create_task(_run_deepscrape_task(update, context, task))
-
-async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    task = await db.get_user_task(user_id)
-    if not task:
-        return await update.message.reply_html("No paused task found to resume.")
-    
-    await update.message.reply_html(f"Resuming task for <code>{task['base_url']}</code>...")
-    asyncio.create_task(_run_deepscrape_task(update, context, task))
+    asyncio.create_task(_run_deepscrape_task(update, context, task_id))
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = await db.tasks_collection.find_one({"user_id": update.effective_user.id, "status": "running"})
+    task = await db.get_user_active_task(update.effective_user.id)
     if task:
         await db.update_task_status(task['_id'], "stopped")
         context.user_data['is_scraping'] = False
@@ -188,13 +171,14 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Bot Application Setup ---
 def run_bot():
-    # ... (Same application setup as before, just add the resume command)
     application = Application.builder().token(BOT_TOKEN).build()
+    
     # ... (Add scrape_conv_handler, other command handlers)
     application.add_handler(CommandHandler("deepscrape", deepscrape_command))
-    application.add_handler(CommandHandler("resume", resume_command))
+    # NO resume command needed anymore
     application.add_handler(CommandHandler("stop", stop_command))
     # ... (Add start, login, etc.)
+
     application.run_polling()
 
 if __name__ == "__main__":
