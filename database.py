@@ -59,7 +59,7 @@ async def get_worker_bots(user_id: int) -> list:
     return (user_data or {}).get("worker_bots", [])
 
 # --- Task Management ---
-async def create_task(user_id: int, base_url: str, all_links: list, target_id: str, upload_as: str, link_range: str):
+async def create_task(user_id: int, base_url: str, all_links: list, target_id: str, upload_as: str, link_range: str, status_message_id: int):
     task = {
         "user_id": user_id,
         "base_url": base_url,
@@ -72,8 +72,9 @@ async def create_task(user_id: int, base_url: str, all_links: list, target_id: s
         "all_links": all_links,
         "completed_links": [],
         "target_id": target_id,
-        "upload_as": upload_as, # 'photo' or 'document'
-        "link_range": link_range, # 'all' or '1-77'
+        "upload_as": upload_as,
+        "link_range": link_range,
+        "status_message_id": status_message_id
     }
     result = await tasks_collection.insert_one(task)
     return result.inserted_id
@@ -95,3 +96,4 @@ async def increment_task_image_upload_count(task_id):
 
 async def complete_link_in_task(task_id, link: str):
     await tasks_collection.update_one({"_id": task_id}, {"$push": {"completed_links": link}})
+
