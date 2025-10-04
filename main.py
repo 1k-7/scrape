@@ -3,9 +3,9 @@ import os
 import asyncio
 import logging
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 import threading
-from collections import Counter
+from collections import Counter, deque
 import sys
 import traceback
 import time
@@ -17,12 +17,13 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, UserAlreadyParticipantError
+from telethon.tl.types import ChatAdminRights
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, PicklePersistence, ConversationHandler
+    ContextTypes, CallbackQueryHandler, PicklePersistence, ConversationHandler, ExtBot
 )
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, BadRequest
@@ -31,6 +32,9 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 
 import database as db
 
@@ -65,6 +69,21 @@ def get_file_extension(url: str):
         path = urlparse(url).path; ext = os.path.splitext(path)[1][1:].lower(); return ext.split('?')[0]
     except: return ""
 
+def get_max_quality_url(url):
+    """Applies heuristics to a URL to try and get a higher-resolution version."""
+    if not url: return None
+    patterns = [
+        (r'/[wh]\d{2,4}-[wh]\d{2,4}-c/', '/'), (r'_\d{2,4}x\d{2,4}(\.(jpe?g|png|webp))', r'\1'),
+        (r'\.\d{2,4}x\d{2,4}(\.(jpe?g|png|webp))', r'\1'), (r'-\d{2,4}x\d{2,4}(\.(jpe?g|png|webp))', r'\1'),
+        (r'/thumb/', '/'), (r'\?(w|h|width|height|size|quality|crop|fit)=.*', '')
+    ]
+    cleaned_url = url
+    for pattern, replacement in patterns:
+        cleaned_url = re.sub(pattern, replacement, cleaned_url)
+    parsed_url = urlparse(cleaned_url)
+    cleaned_url = urlunparse(parsed_url._replace(query='', fragment=''))
+    return cleaned_url
+
 # --- Hyper-Aggressive Scraping Logic ---
 def setup_selenium_driver():
     """Initializes the Selenium WebDriver, pointing to the pre-installed chromedriver."""
@@ -73,10 +92,8 @@ def setup_selenium_driver():
     
     chrome_options = Options()
     chrome_options.binary_location = "/usr/bin/google-chrome"
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--headless"); chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage"); chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1200")
     
     try:
@@ -88,126 +105,141 @@ def setup_selenium_driver():
         return None
 
 def scrape_images_from_url_sync(url: str, user_data: dict):
-    """Synchronous, thread-safe, hyper-aggressive scraping function with detailed logging and advanced image detection."""
-    logger.info(f"Starting HYPER-AGGRESSIVE scrape for URL: {url}")
+    """Advanced scraper that simulates human interaction, handles AJAX, and attempts to find max quality images."""
+    logger.info(f"Starting MAX-QUALITY scrape for URL: {url}")
     driver = setup_selenium_driver()
-    if not driver:
-        logger.error(f"Driver not available. Aborting scrape for {url}.")
-        return set()
+    if not driver: return set()
 
     images = set()
     try:
-        logger.info(f"Driver getting URL: {url}")
         driver.get(url)
-        logger.info(f"Driver finished getting URL. Waiting for initial load.")
-        time.sleep(3) # Wait for any initial dynamic content to load
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        logger.info(f"Initial page load complete for {url}.")
 
-        # --- Popup clicking logic ---
-        popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes', 'i agree']
-        js_popup_script = f"var keywords = {popup_keywords}; var buttons = document.querySelectorAll('button, a, div, span'); var clicked = false; for (var i = 0; i < buttons.length; i++) {{ var buttonText = buttons[i].innerText.toLowerCase(); for (var j = 0; j < keywords.length; j++) {{ if (buttonText.includes(keywords[j])) {{ buttons[i].click(); clicked = true; break; }} }} if (clicked) break; }} return clicked;"
-        try:
-            if driver.execute_script(js_popup_script): logger.info(f"Clicked a popup on {url}."); time.sleep(3)
-        except Exception as e: logger.warning(f"Popup click script failed for {url}: {e}")
+        def wait_for_network_idle(driver, timeout=10, idle_time=2):
+            logger.info("Waiting for network activity to become idle...")
+            script = "const callback=arguments[arguments.length-1];let last_resource_count=0;let stable_checks=0;const check_interval=250;const check_network=()=>{const current_resource_count=window.performance.getEntriesByType('resource').length;if(current_resource_count===last_resource_count)stable_checks++;else{stable_checks=0;last_resource_count=current_resource_count}if(stable_checks*check_interval>=(idle_time*1000))callback(true);else setTimeout(check_network,check_interval)};check_network();"
+            try:
+                driver.set_script_timeout(timeout); driver.execute_async_script(script)
+                logger.info("Network is idle.")
+            except Exception:
+                logger.warning(f"Network idle check timed out after {timeout}s. Proceeding anyway.")
         
-        # --- Aggressive scrolling to trigger lazy loading ---
-        logger.info(f"Starting to scroll and find images on {url}")
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        stable_count = 0
-        scroll_attempts = 0
-        while stable_count < 3 and scroll_attempts < 15: # Limit scrolls to prevent infinite loops
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2) # Give time for images to load
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                stable_count += 1
-            else:
-                stable_count = 0
-            last_height = new_height
-            scroll_attempts += 1
-            if not user_data.get('is_scraping', True): 
-                logger.info("Scraping stopped by user flag.")
-                break
-        logger.info(f"Scrolling finished after {scroll_attempts} attempts.")
+        wait_for_network_idle(driver)
 
-        # --- Advanced Image Extraction with JavaScript ---
-        logger.info(f"Executing advanced image extraction script on {url}.")
-        js_extraction_script = """
-            const urls = new Set();
-            const imageExtensions = /\.(jpeg|jpg|png|gif|webp|bmp|svg)$/i;
+        logger.info("Starting human-like scrolling...")
+        total_height = driver.execute_script("return document.body.scrollHeight")
+        for i in range(0, total_height, 500):
+            driver.execute_script(f"window.scrollTo(0, {i});"); time.sleep(0.3)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        logger.info("Scrolling complete. Waiting for new content.")
+        wait_for_network_idle(driver); time.sleep(2)
 
-            // 1. Get all <img> tags and their potential sources
-            document.querySelectorAll('img').forEach(img => {
-                if (img.src) urls.add(img.src);
-                if (img.dataset.src) urls.add(img.dataset.src);
-                if (img.dataset.lazySrc) urls.add(img.dataset.lazySrc);
-                if (img.dataset.fallbackSrc) urls.add(img.dataset.fallbackSrc);
-                if (img.srcset) {
-                    img.srcset.split(',').forEach(part => {
-                        urls.add(part.trim().split(' ')[0]);
-                    });
-                }
-            });
-
-            // 2. Get all <a> tags linking to images
-            document.querySelectorAll('a').forEach(a => {
-                if (a.href && imageExtensions.test(a.href)) {
-                    urls.add(a.href);
-                }
-            });
-            
-            // 3. Get all <source> tags
-            document.querySelectorAll('source').forEach(source => {
-                 if (source.srcset) {
-                    source.srcset.split(',').forEach(part => {
-                        urls.add(part.trim().split(' ')[0]);
-                    });
-                }
-            });
-
-            // 4. Find background images from all elements
-            document.querySelectorAll('*').forEach(el => {
-                const style = window.getComputedStyle(el, null).getPropertyValue('background-image');
-                if (style && style.includes('url')) {
-                    const match = style.match(/url\\(["']?([^"']*)["']?\\)/);
-                    if (match && match[1]) {
-                        urls.add(match[1]);
-                    }
-                }
-            });
-
-            return Array.from(urls);
-        """
+        logger.info(f"Executing MAX-QUALITY image extraction script on {url}.")
+        js_extraction_script = "const imageCandidates=new Map();const imageExtensions=/\\.(jpeg|jpg|png|gif|webp|bmp|svg)/i;function addCandidate(key,url,priority){if(!url||url.startsWith('data:image'))return;if(!imageCandidates.has(key)){imageCandidates.set(key,{url:url,priority:priority})}else if(priority>imageCandidates.get(key).priority){imageCandidates.set(key,{url:url,priority:priority})}}document.querySelectorAll('img').forEach((img,index)=>{const key=img.src||`img_${index}`;addCandidate(key,img.src,1);if(img.dataset.src)addCandidate(key,img.dataset.src,1);if(img.srcset){let maxUrl=null;let maxWidth=0;img.srcset.split(',').forEach(part=>{const parts=part.trim().split(/\\s+/);const url=parts[0];const widthMatch=parts[1]?parts[1].match(/(\\d+)w/):null;if(widthMatch){const width=parseInt(widthMatch[1],10);if(width>maxWidth){maxWidth=width;maxUrl=url}}else{maxUrl=url}});if(maxUrl)addCandidate(key,maxUrl,2)}const parentAnchor=img.closest('a');if(parentAnchor&&parentAnchor.href&&imageExtensions.test(parentAnchor.href)){addCandidate(key,parentAnchor.href,3)}});document.querySelectorAll('*').forEach(el=>{const style=window.getComputedStyle(el,null).getPropertyValue('background-image');if(style&&style.includes('url')){const match=style.match(/url\\([\"']?([^\"']*)[\"']?\\)/);if(match&&match[1]){addCandidate(match[1],match[1],1)}}});return Array.from(imageCandidates.values()).map(c=>c.url);"
         extracted_urls = driver.execute_script(js_extraction_script)
-        logger.info(f"JS script extracted {len(extracted_urls)} potential URLs.")
+        logger.info(f"JS script extracted {len(extracted_urls)} candidate URLs.")
         
-        # Process and resolve URLs in Python
         for img_url in extracted_urls:
             if img_url and img_url.strip():
-                images.add(urljoin(url, img_url.strip()))
+                absolute_url = urljoin(url, img_url.strip())
+                max_quality_guess = get_max_quality_url(absolute_url)
+                images.add(max_quality_guess)
 
-        logger.info(f"Found {len(images)} potential images on {url}.")
-    except Exception as e:
-        logger.error(f"Error scraping {url}: {e}", exc_info=True)
+    except Exception as e: logger.error(f"Error scraping {url}: {e}", exc_info=True)
     finally:
-        logger.info(f"Quitting driver for {url}.")
-        driver.quit()
+        logger.info(f"Quitting driver for {url}."); driver.quit()
     
-    # Final cleanup
-    final_images = {img for img in images if img and img.startswith('http') and not img.startswith('data:image')}
-    logger.info(f"Returning {len(final_images)} valid, absolute image URLs from {url}.")
+    final_images = {img for img in images if img and img.startswith('http')}
+    logger.info(f"Returning {len(final_images)} valid, max-quality image URLs from {url}.")
     return final_images
 
-
-# --- UTILITY & PERMISSION COMMANDS ---
+# --- UTILITY, PERMISSION & WORKER COMMANDS ---
 async def get_userbot_client(session_string: str):
     if not session_string: return None
     client = TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
-    await client.connect()
-    return client
+    await client.connect(); return client
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    message = (f"Hi <b>{user.mention_html()}</b>! I am the fully operational Image Scraper Bot.\n\n<b>Single Scraping:</b>\n• <code>/scrape [url]</code>\n• <code>/settarget [chat_id]</code>\n\n<b>Deep Scraping (User Account Required for Setup):</b>\n• <code>/login</code> (Only for <code>/creategroup</code>)\n• <code>/deepscrape [url]</code>\n• <code>/setgroup [chat_id]</code>\n• <code>/creategroup [name]</code>\n\n<b>General:</b>\n• <code>/status</code> - Check status of an active deepscrape.\n• <code>/mydata</code> - View your current settings.\n• <code>/stop</code> or <code>/cancel</code> - Stop any active task.")
+    message = (f"Hi <b>{user.mention_html()}</b>! Welcome to the Image Scraper Bot.\n\n"
+               "<b>Core Commands:</b>\n"
+               "• `/scrape [url]` - Scrape a single URL.\n"
+               "• `/deepscrape [url]` - Scrape all links found on a URL.\n\n"
+               "<b>Setup Commands:</b>\n"
+               "• `/settarget [chat_id]` - Set target for single scrapes.\n"
+               "• `/setgroup [group_id]` - Set target group for deep scrapes.\n"
+               "• `/login` - Login with your user account (needed for `/creategroup` and `/addworkers`).\n\n"
+               "<b>Worker Bot Fleet (for Deep Scrapes):</b>\n"
+               "• `/addworkers [bot_token] [bot_token]...`\n"
+               "• `/listworkers`\n"
+               "• `/removeworkers [bot_id] [bot_id]...`\n\n"
+               "<b>Other Commands:</b>\n"
+               "• `/status`, `/mydata`, `/stop`")
     await update.message.reply_html(message)
+
+async def addworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ud = await db.get_user_data(user_id)
+    if not ud or 'session_string' not in ud:
+        return await update.message.reply_html("You must `/login` with your user account first to manage workers.")
+    if not ud.get('target_group_id'):
+        return await update.message.reply_html("You must `/setgroup` first before adding workers.")
+    if not context.args:
+        return await update.message.reply_html("<b>Usage:</b> `/addworkers [bot_token_1] [bot_token_2]...`")
+
+    msg = await update.message.reply_html("Processing worker tokens...")
+    added_workers, failed_workers = [], []
+    
+    target_group_id = int(ud.get('target_group_id'))
+    admin_rights = ChatAdminRights(post_messages=True, edit_messages=True, delete_messages=True)
+
+    async with await get_userbot_client(ud['session_string']) as client:
+        for token in context.args:
+            try:
+                worker_bot = ExtBot(token=token)
+                worker_info = await worker_bot.get_me()
+                
+                await msg.edit_text(f"Inviting and promoting @{worker_info.username}...")
+                try:
+                    await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_info.id]))
+                except UserAlreadyParticipantError:
+                    pass # Bot is already in the group, that's fine
+                await client(functions.channels.EditAdminRequest(target_group_id, worker_info.id, admin_rights, "Worker Bot"))
+                
+                worker_data = {"id": worker_info.id, "username": worker_info.username, "token": token}
+                await db.add_worker_bots(user_id, [worker_data])
+                added_workers.append(f"• @{worker_info.username} (<code>{worker_info.id}</code>)")
+            except Exception as e:
+                failed_workers.append(f"• <code>{token[:8]}...</code> (Error: {e})")
+
+    response_text = "✅ <b>Worker setup complete!</b>\n\n"
+    if added_workers:
+        response_text += "<b>Added & Promoted:</b>\n" + "\n".join(added_workers) + "\n\n"
+    if failed_workers:
+        response_text += "<b>Failed:</b>\n" + "\n".join(failed_workers)
+    
+    await msg.edit_text(response_text, parse_mode=ParseMode.HTML)
+
+async def listworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    workers = await db.get_worker_bots(update.effective_user.id)
+    if not workers:
+        return await update.message.reply_html("You have no worker bots configured.")
+    
+    worker_list = [f"• @{w['username']} (<code>{w['id']}</code>)" for w in workers]
+    await update.message.reply_html("<b>Your configured worker bots:</b>\n" + "\n".join(worker_list))
+
+async def removeworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_html("<b>Usage:</b> `/removeworkers [bot_id_1] [bot_id_2]...`")
+    
+    try:
+        worker_ids = [int(arg) for arg in context.args]
+        await db.remove_worker_bots(update.effective_user.id, worker_ids)
+        await update.message.reply_html(f"✅ Removed bots with IDs: <code>{', '.join(context.args)}</code> from the worker pool.")
+    except ValueError:
+        await update.message.reply_html("Invalid bot ID. Please provide numeric IDs only.")
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await start_command(update, context)
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await db.get_user_active_task(update.effective_user.id)
@@ -219,7 +251,12 @@ async def mydata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = await db.get_user_data(update.effective_user.id)
     target_chat = (ud or {}).get('target_chat_id', 'Not Set'); target_group = (ud or {}).get('target_group_id', 'Not Set')
     session_set = "Yes" if (ud or {}).get('session_string') else "No"
-    message = (f"<b>Your Settings:</b>\n\n👤 <b>Logged In (for /creategroup):</b> {session_set}\n🎯 <b>Single Scrape Target:</b> <code>{target_chat}</code>\n🗂️ <b>Deep Scrape Target:</b> <code>{target_group}</code>")
+    worker_count = len((ud or {}).get('worker_bots', []))
+    message = (f"<b>Your Settings:</b>\n\n"
+               f"👤 <b>Logged In:</b> {session_set}\n"
+               f"🎯 <b>Single Scrape Target:</b> <code>{target_chat}</code>\n"
+               f"🗂️ <b>Deep Scrape Target:</b> <code>{target_group}</code>\n"
+               f"🤖 <b>Worker Bots:</b> {worker_count}")
     await update.message.reply_html(message)
 async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/settarget [chat_id]</code> or <code>/settarget me</code>")
@@ -241,64 +278,46 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_admins = await context.bot.get_chat_administrators(chat_id=group_id)
         bot_is_admin = any(admin.user.id == context.bot.id for admin in chat_admins)
         if not bot_is_admin:
-            return await update.message.reply_html(f"<b>Permission Denied!</b>\nI am not an administrator in that group. Please make me an admin with topic creation permissions.")
+            return await update.message.reply_html(f"<b>Permission Denied!</b>\nI am not an administrator in that group.")
     except Exception as e:
-        return await update.message.reply_html(f"<b>Could not verify permissions.</b>\nMake sure the ID is correct and I am in the group.\n<b>Error:</b> <code>{e}</code>")
+        return await update.message.reply_html(f"<b>Could not verify permissions.</b>\n<b>Error:</b> <code>{e}</code>")
     await db.save_user_data(update.effective_user.id, {'target_group_id': group_id})
     await update.message.reply_html(f"✅ Deep scrape target group set to <code>{group_id}</code>.")
 
 # --- CORE LOGIC HANDLERS ---
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Please send your Telethon session string. This is only needed for /creategroup.")
+    await update.message.reply_text("Please send your Telethon session string.")
     return 'awaiting_session'
-
+# ... (scrape_command, status_callback, etc. are largely unchanged)
 async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
     try:
         async with await get_userbot_client(session_string) as client:
-            if not client or not await client.is_user_authorized(): return await update.message.reply_text("❌ Login failed. Invalid session string.")
+            if not client or not await client.is_user_authorized(): return await update.message.reply_text("❌ Login failed.")
             me = await client.get_me()
             await db.save_user_data(update.effective_user.id, {'session_string': session_string})
             await update.message.reply_html(f"✅ Logged in as <b>{me.first_name}</b>!")
         return ConversationHandler.END
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {e}"); return ConversationHandler.END
+
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = "";
-    if context.args: url = preprocess_url(context.args[0])
-    elif update.message.reply_to_message and update.message.reply_to_message.text: url = find_url_in_text(update.message.reply_to_message.text)
-    if not url: await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code> or reply to a message."); return ConversationHandler.END
+    url = find_url_in_text(update.message.text) or (context.args[0] if context.args else None)
+    if not url: await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code>"); return ConversationHandler.END
+    
     context.user_data['is_scraping'] = True
-    msg = await update.message.reply_html(f"🔎 Scraping <code>{url}</code>... This may take a moment.")
-    images = await asyncio.to_thread(scrape_images_from_url_sync, url, context.user_data)
+    msg = await update.message.reply_html(f"🔎 Scraping <code>{preprocess_url(url)}</code>...")
+    images = await asyncio.to_thread(scrape_images_from_url_sync, preprocess_url(url), context.user_data)
     if not context.user_data.get('is_scraping', False): return ConversationHandler.END
-    context.user_data['is_scraping'] = False
+    
     if not images: await msg.edit_text("Could not find any images on that page."); return ConversationHandler.END
-    context.user_data['scraped_images'] = list(images); file_types = Counter(get_file_extension(img) for img in images)
-    keyboard = []
-    for ext, count in file_types.items(): keyboard.append([InlineKeyboardButton(f"{(ext or 'Other').upper()} ({count})", callback_data=f"scrape_{ext or 'none'}")])
+    
+    context.user_data['scraped_images'] = list(images)
+    file_types = Counter(get_file_extension(img) for img in images)
+    keyboard = [[InlineKeyboardButton(f"{(ext or 'Other').upper()} ({count})", callback_data=f"scrape_{ext or 'none'}")] for ext, count in file_types.items()]
     keyboard.append([InlineKeyboardButton(f"All Files ({len(images)})", callback_data="scrape_all")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await msg.edit_text("✅ <b>Scan complete!</b> Choose file type:", reply_markup=reply_markup)
+    await msg.edit_text("✅ <b>Scan complete!</b> Choose file type:", reply_markup=InlineKeyboardMarkup(keyboard))
     return 'awaiting_file_type'
-async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    task = await db.get_user_active_task(update.effective_user.id)
-    if not task:
-        await query.edit_message_text("No active deepscrape task found, or it has completed.")
-        return
-
-    message = (
-        f"📊 <b>Task Status:</b> {task['status'].title()}\n"
-        f"🔗 <b>Progress:</b> Link {task['current_link_index'] + 1} of {task['total_links']}\n"
-        f"📄 <b>Current URL:</b> <code>...{task['current_link_url'][-50:]}</code>\n"
-        f"🖼️ <b>Images Found:</b> {task['current_link_images_found']}\n"
-        f"📤 <b>Images Uploaded:</b> {task['current_link_images_uploaded']}"
-    )
-    keyboard = [[InlineKeyboardButton("Refresh Status", callback_data="show_status")]]
-    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
-
 async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -319,15 +338,31 @@ async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAUL
     context.user_data['is_scraping'] = False
     await query.message.reply_html("✅ <b>Sending complete!</b>")
     return ConversationHandler.END
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task = await db.get_user_active_task(update.effective_user.id)
+    if not task:
+        await query.edit_message_text("No active deepscrape task found, or it has completed.")
+        return
+
+    message = (
+        f"📊 <b>Task Status:</b> {task['status'].title()}\n"
+        f"🔗 <b>Progress:</b> Link {task['current_link_index'] + 1} of {task['total_links']}\n"
+        f"📄 <b>Current URL:</b> <code>...{task['current_link_url'][-50:]}</code>\n"
+        f"🖼️ <b>Images Found:</b> {task['current_link_images_found']}\n"
+        f"📤 <b>Images Uploaded:</b> {task['current_link_images_uploaded']}"
+    )
+    keyboard = [[InlineKeyboardButton("Refresh Status", callback_data="show_status")]]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 async def conv_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await stop_command(update, context)
-    return ConversationHandler.END
+    await stop_command(update, context); return ConversationHandler.END
 async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = await db.get_user_data(update.effective_user.id)
-    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first for this command.")
-    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/creategroup [Your Group Name]</code>")
+    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first.")
+    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/creategroup [Name]</code>")
     group_name = " ".join(context.args)
-    msg = await update.message.reply_html(f"Creating supergroup '<b>{group_name}</b>' with your user account...")
+    msg = await update.message.reply_html(f"Creating supergroup '<b>{group_name}</b>'...")
     try:
         async with await get_userbot_client(ud['session_string']) as client:
             created_chat = await client(functions.messages.CreateChatRequest(users=[(await context.bot.get_me()).username], title=group_name))
@@ -337,13 +372,13 @@ async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             supergroup_id = int(f"-100{full_channel.full_chat.id}")
             await client.edit_admin(entity=supergroup_id, user=context.bot.id, is_admin=True, manage_topics=True)
             await db.save_user_data(update.effective_user.id, {'target_group_id': str(supergroup_id)})
-            await msg.edit_text(f"✅ Supergroup created & set as target!\nI have been made an admin.\n<b>Name:</b> {group_name}\n<b>ID:</b> <code>{supergroup_id}</code>", parse_mode=ParseMode.HTML)
+            await msg.edit_text(f"✅ Supergroup created & set as target!\n<b>ID:</b> <code>{supergroup_id}</code>", parse_mode=ParseMode.HTML)
     except Exception as e: await msg.edit_text(f"An error occurred: {e}", parse_mode=ParseMode.HTML)
 async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ud = await db.get_user_data(user_id)
-    if await db.get_user_active_task(user_id): return await update.message.reply_html("You already have an active deepscrape task. Use /stop first.")
-    if not ud or not ud.get('target_group_id'): return await update.message.reply_html("❌ Deepscrape target group not set. Use /setgroup first.")
+    if await db.get_user_active_task(user_id): return await update.message.reply_html("You already have an active deepscrape task.")
+    if not ud or not ud.get('target_group_id'): return await update.message.reply_html("❌ Target group not set. Use /setgroup.")
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/deepscrape [url]</code>")
     base_url = preprocess_url(context.args[0])
     msg = await update.message.reply_html(f"Scanning <code>{base_url}</code> for links...")
@@ -351,12 +386,12 @@ async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         links_response = await asyncio.to_thread(requests.get, base_url, headers={'User-Agent': 'Mozilla/5.0'})
         soup = BeautifulSoup(links_response.content, 'html.parser')
         links = sorted(list({urljoin(base_url, a['href']) for a in soup.find_all('a', href=True) if urljoin(base_url, a.get('href', '')) != base_url and not (urljoin(base_url, a.get('href', ''))).endswith(('.zip', '.rar', '.exe', '.pdf'))}))
-        if not links: return await msg.edit_text("Found no unique, valid links on that page to scrape.")
+        if not links: return await msg.edit_text("Found no unique, valid links.")
         task_id = await db.create_task(user_id, base_url, links)
         keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
-        await msg.edit_text(f"Found {len(links)} links. Starting deep scrape in the background.\nTo cancel, use /stop.", reply_markup=InlineKeyboardMarkup(keyboard))
+        await msg.edit_text(f"Found {len(links)} links. Starting deep scrape.", reply_markup=InlineKeyboardMarkup(keyboard))
         context.application.create_task(_run_deepscrape_task(user_id, task_id, context.application))
-    except Exception as e: await msg.edit_text(f"Failed to fetch links from URL. Error: {e}")
+    except Exception as e: await msg.edit_text(f"Failed to fetch links. Error: {e}")
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await db.get_user_active_task(update.effective_user.id)
     if not task: return await update.message.reply_html("No active deepscrape task found.")
@@ -367,93 +402,85 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
     ud = await db.get_user_data(user_id)
     target_group = ud.get('target_group_id')
     if not target_group:
-        await application.bot.send_message(user_id, "<b>Error:</b> Deepscrape target group not set. Stopping task.", parse_mode=ParseMode.HTML)
-        return
+        await application.bot.send_message(user_id, "<b>Error:</b> Target group not set."); return
+
+    worker_bots_data = await db.get_worker_bots(user_id)
+    worker_clients = [ExtBot(token=w['token']) for w in worker_bots_data]
+    
+    # Use main bot as fallback if no workers are configured
+    if not worker_clients:
+        worker_clients.append(application.bot)
+        await application.bot.send_message(user_id, "⚠️ No worker bots found. Using main bot for uploads. This may be slow.")
+
+    worker_pool = deque(worker_clients)
+    resting_workers = {} # {bot_id: unban_timestamp}
 
     await db.update_task_status(task_id, "running")
-    await application.bot.send_message(user_id, "🚀 <b>Deepscrape task started!</b>", parse_mode=ParseMode.HTML)
+    await application.bot.send_message(user_id, f"🚀 <b>Deepscrape task started with {len(worker_clients)} uploader(s)!</b>", parse_mode=ParseMode.HTML)
+    
     try:
         while True:
             task = await db.tasks_collection.find_one({"_id": task_id})
-            if not task or task['status'] != 'running':
-                if task and task.get('status') == 'stopped':
-                    await application.bot.send_message(user_id, "🛑 <b>Deepscrape task has been stopped by user.</b>", parse_mode=ParseMode.HTML)
-                break
+            if not task or task['status'] != 'running': break
 
             pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
             if not pending_links:
-                await db.update_task_status(task_id, "completed")
-                await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b> All links processed.", parse_mode=ParseMode.HTML)
-                break
+                await db.update_task_status(task_id, "completed"); await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b>"); break
 
             link = pending_links[0]
             current_link_num = len(task['completed_links']) + 1
             await db.update_task_counters(task_id, current_link_num - 1, link, 0)
             await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
-
+            
             images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
-            task = await db.tasks_collection.find_one({"_id": task_id})
-            if task['status'] == 'stopped': break
-
+            if task.get('status') == 'stopped': break
             if not images:
-                await db.complete_link_in_task(task_id, link)
-                await application.bot.send_message(user_id, f"Link {current_link_num} had no images. Moving to next.", parse_mode=ParseMode.HTML)
-                continue
-
+                await db.complete_link_in_task(task_id, link); continue
+            
             await db.update_task_counters(task_id, current_link_num - 1, link, len(images))
+            
+            try:
+                topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
+                created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title)
+                topic_id = created_topic.message_thread_id
+            except Exception as e:
+                await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}. Stopping task."); await db.update_task_status(task_id, "paused"); return
+            
+            await application.bot.send_message(user_id, f"Found {len(images)} images. Starting upload with worker fleet...")
+            
+            upload_tasks = []
+            image_queue = deque(images)
 
-            topic_id = None
-            while not topic_id:
-                task = await db.tasks_collection.find_one({"_id": task_id})
-                if task['status'] == 'stopped': break
-                try:
-                    topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
-                    created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title)
-                    topic_id = created_topic.message_thread_id
-                    await application.bot.send_message(user_id, f"Created topic '<b>{topic_title}</b>' for link {current_link_num}.", parse_mode=ParseMode.HTML)
-                except RetryAfter as e:
-                    await db.update_task_status(task_id, "paused")
-                    await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Topic creation limit. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
-                    await asyncio.sleep(e.retry_after + 5)
-                    await db.update_task_status(task_id, "running")
-                except Exception as e:
-                    await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}. Ensure I have admin rights to manage topics. Stopping task.", parse_mode=ParseMode.HTML)
-                    await db.update_task_status(task_id, "paused")
-                    return
-
-            if not topic_id: continue
-
-            await application.bot.send_message(user_id, f"Found {len(images)} images for link {current_link_num}. Starting upload...")
-            for img_url in images:
-                while True:
-                    task = await db.tasks_collection.find_one({"_id": task_id})
-                    if task['status'] == 'stopped': break
+            async def upload_worker(worker_bot):
+                while image_queue:
                     try:
-                        await application.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
+                        img_url = image_queue.popleft()
+                    except IndexError:
+                        break # Queue is empty
+                    
+                    try:
+                        await worker_bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
                         await db.increment_task_image_upload_count(task_id)
-                        break
                     except RetryAfter as e:
-                        await db.update_task_status(task_id, "paused")
-                        await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Upload limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
-                        await asyncio.sleep(e.retry_after + 5)
-                        await db.update_task_status(task_id, "running")
+                        logger.warning(f"Worker @{worker_bot.username} hit flood wait for {e.retry_after}s. Resting.")
+                        image_queue.appendleft(img_url) # Put image back
+                        await asyncio.sleep(e.retry_after + 2)
                     except Exception as e:
-                        logger.warning(f"Failed to send photo {img_url}: {e}")
-                        break
-                if task['status'] == 'stopped': break
+                        logger.error(f"Worker @{worker_bot.username} failed to send {img_url}: {e}")
+            
+            for worker in worker_clients:
+                upload_tasks.append(asyncio.create_task(upload_worker(worker)))
+            
+            await asyncio.gather(*upload_tasks)
 
-            if task['status'] == 'running':
+            if task.get('status') == 'running':
                 await db.complete_link_in_task(task_id, link)
                 await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
-
+    
     except Exception as e:
         logger.error(f"Error in _run_deepscrape_task: {e}", exc_info=True)
         await db.update_task_status(task_id, "paused")
-        try:
-            await application.bot.send_message(user_id, f"An unexpected error occurred in the deepscrape task: <code>{e}</code>. The task has been paused.", parse_mode=ParseMode.HTML)
-        except Exception as send_e:
-            logger.error(f"Failed to send error message to user: {send_e}")
-
+        await application.bot.send_message(user_id, f"An unexpected error occurred: <code>{e}</code>. Task paused.", parse_mode=ParseMode.HTML)
 
 # --- Main Application Setup ---
 def main():
@@ -480,6 +507,8 @@ def main():
         CommandHandler("mydata", mydata_command), CommandHandler("status", status_command),
         CommandHandler("settarget", settarget_command), CommandHandler("setgroup", setgroup_command),
         CommandHandler("creategroup", creategroup_command), CommandHandler("deepscrape", deepscrape_command),
+        CommandHandler("addworkers", addworkers_command), CommandHandler("listworkers", listworkers_command),
+        CommandHandler("removeworkers", removeworkers_command),
         login_conv_handler, scrape_conv_handler,
         CallbackQueryHandler(status_callback, pattern="^show_status$"),
     ]
