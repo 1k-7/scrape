@@ -1,7 +1,7 @@
 # handlers.py
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 import math
 
@@ -429,7 +429,6 @@ async def scrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     
     context.user_data['url'] = url
-    context.user_data['scrape_type'] = 'single'
     
     targets = await db.get_targets(update.effective_user.id)
     if not targets:
@@ -475,9 +474,8 @@ async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
         
     context.user_data['url'] = url
-    context.user_data['scrape_type'] = 'deep'
     
-    msg = await update.message.reply_text("Scanning URL for links...")
+    msg = await update.message.reply_text("Scanning URL for links, this may take a moment...")
     try:
         response = await asyncio.to_thread(requests.get, url, headers={'User-Agent': 'Mozilla/5.0'})
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -486,29 +484,30 @@ async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT
             if urljoin(url, a.get('href', '')) != url and not (urljoin(url, a.get('href', ''))).endswith(('.zip', '.rar', '.exe', '.pdf'))
         }))
         context.user_data['all_links'] = links
-        await msg.delete()
+        
+        if not links:
+            await msg.edit_text("Found no valid links on that page.")
+            return ConversationHandler.END
+
+        await msg.edit_text(
+            f"Found {len(links)} total links.\n\n"
+            "Please specify the range of links to process (e.g., `1-77`)\n\nor use /all to process all links."
+        )
+        return SCRAPE_LINK_RANGE
+        
     except Exception as e:
         await msg.edit_text(f"Failed to fetch links. Error: {e}")
         return ConversationHandler.END
 
-    if not context.user_data.get('all_links'):
-        await update.message.reply_text("Found no valid links on that page.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "Please specify the range of links to process (e.g., `1-77`)\n\nor use /all to process all links."
-    )
-    return SCRAPE_LINK_RANGE
-
 async def scrape_link_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['link_range'] = update.message.text.strip().lower()
-    return await prompt_for_targets(update, context)
+    return await prompt_for_targets(update.message, context)
 
 async def scrape_all_links_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['link_range'] = 'all'
-    return await prompt_for_targets(update, context)
+    return await prompt_for_targets(update.message, context)
 
-async def prompt_for_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def prompt_for_targets(message: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     all_links = context.user_data['all_links']
     link_range = context.user_data['link_range']
     
@@ -526,16 +525,16 @@ async def prompt_for_targets(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['num_targets_needed'] = num_targets_needed
     context.user_data['selected_targets'] = []
     
-    targets = await db.get_targets(update.effective_user.id)
+    targets = await db.get_targets(message.from_user.id)
     if len(targets) < num_targets_needed:
-        await update.message.reply_text(
+        await message.reply_text(
             f"This scrape requires {num_targets_needed} target(s), but you only have {len(targets)} saved. "
             "Please add more targets via the settings menu."
         )
         return ConversationHandler.END
 
     keyboard = [[InlineKeyboardButton(t['name'], callback_data=f"multi_target_{t['id']}")] for t in targets]
-    await update.message.reply_text(
+    await message.reply_text(
         f"This scrape requires {num_targets_needed} target(s). Please select target 1:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -595,14 +594,14 @@ async def confirm_upload_options_callback(update: Update, context: ContextTypes.
         await query.answer("Please select at least one upload format.", show_alert=True)
         return SCRAPE_UPLOAD_AS
         
-    await query.edit_message_text("Starting deep scrape...")
+    await query.edit_message_text("Initializing deep scrape task...")
     await start_deep_scrape(update, context)
     return ConversationHandler.END
 
 async def cancel_scrape_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Scrape cancelled.")
+    await query.edit_message_text("Operation cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -642,13 +641,16 @@ async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data['link_range'], user_data['all_links']
     )
     
-    msg = await context.bot.send_message(chat_id, "Initializing deep scrape task...")
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Progress", callback_data="refresh_progress")]]
+    msg = await context.bot.send_message(
+        chat_id, 
+        "✅ Deepscrape task has been started in the background. Use /stop to cancel.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
     task_id = await db.create_task(
         update.effective_user.id, url, all_links, target_ids, upload_as, link_range, msg.message_id
     )
-    
-    await msg.edit_message_text(f"Deep scrape has started in the background. Use /stop to cancel.")
     
     context.application.create_task(
         run_deepscrape_task(
@@ -659,3 +661,57 @@ async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
     context.user_data.clear()
+
+async def refresh_progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("Fetching latest progress...")
+    
+    task = await db.get_user_active_task(query.from_user.id)
+    if not task:
+        await query.edit_message_text("This task has already completed or been stopped.", reply_markup=None)
+        return
+
+    links_to_process = task['all_links']
+    if task['link_range'] != 'all':
+        try:
+            start, end = map(int, task['link_range'].split('-'))
+            links_to_process = links_to_process[start-1:end]
+        except (ValueError, IndexError):
+            pass
+
+    total_links_in_range = len(links_to_process)
+    completed_count = len(task.get('completed_links', []))
+    
+    start_time = task.get('task_start_time')
+    elapsed_time_str = "N/A"
+    eta_str = "N/A"
+    if start_time and completed_count > 0:
+        elapsed_seconds = (datetime.now() - start_time).total_seconds()
+        elapsed_time_str = str(timedelta(seconds=int(elapsed_seconds)))
+        
+        time_per_link = elapsed_seconds / completed_count
+        remaining_links = total_links_in_range - completed_count
+        remaining_seconds = remaining_links * time_per_link
+        eta_str = str(timedelta(seconds=int(remaining_seconds)))
+
+    progress_percent = (completed_count / total_links_in_range * 100) if total_links_in_range > 0 else 0
+    
+    progress_text = (
+        f"📊 **Deepscrape Progress**\n\n"
+        f"Status: `{task['status']}`\n"
+        f"Overall Progress: `{completed_count} / {total_links_in_range}` links ({progress_percent:.2f}%)\n"
+        f"Total Images Uploaded: `{task.get('total_images_uploaded', 0)}`\n"
+        f"Elapsed Time: `{elapsed_time_str}`\n"
+        f"ETA: `{eta_str}`\n\n"
+        f"--- **Current Link** ---\n"
+        f"URL: `{task.get('current_link_url', 'N/A')}`\n"
+        f"Images Found: `{task.get('current_link_images_found', 0)}`\n"
+        f"Images Uploaded: `{task.get('current_link_images_uploaded', 0)}`"
+    )
+
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Progress", callback_data="refresh_progress")]]
+    try:
+        await query.edit_message_text(progress_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.warning(f"Failed to refresh progress: {e}")
