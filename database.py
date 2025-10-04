@@ -21,11 +21,32 @@ async def get_user_data(user_id: int) -> dict:
 async def save_user_data(user_id: int, data_to_update: dict):
     await users_collection.update_one({"_id": user_id}, {"$set": data_to_update}, upsert=True)
 
+async def add_worker_bots(user_id: int, workers_to_add: list):
+    """Adds a list of worker bot objects to the user's data."""
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$addToSet": {"worker_bots": {"$each": workers_to_add}}},
+        upsert=True
+    )
+
+async def remove_worker_bots(user_id: int, worker_ids_to_remove: list):
+    """Removes worker bots by their ID."""
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$pull": {"worker_bots": {"id": {"$in": worker_ids_to_remove}}}}
+    )
+
+async def get_worker_bots(user_id: int) -> list:
+    """Retrieves the list of worker bots for a user."""
+    user_data = await users_collection.find_one({"_id": user_id})
+    return (user_data or {}).get("worker_bots", [])
+
+
 async def create_task(user_id: int, base_url: str, all_links: list) -> str:
     task = {
         "user_id": user_id,
         "base_url": base_url,
-        "status": "pending", # Start as pending
+        "status": "pending",
         "total_links": len(all_links),
         "current_link_index": 0,
         "current_link_url": "Initializing...",
