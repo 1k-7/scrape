@@ -9,6 +9,7 @@ from collections import Counter
 import sys
 import traceback
 import time
+import random
 
 from flask import Flask
 import requests
@@ -125,7 +126,7 @@ async def get_userbot_client(session_string: str):
     return client
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    message = (f"Hi <b>{user.mention_html()}</b>! I am the fully operational Image Scraper Bot.\n\n<b>Single Scraping:</b>\n• <code>/scrape [url]</code>\n• <code>/settarget [chat_id]</code>\n\n<b>Deep Scraping (User Account Required):</b>\n• <code>/login</code>\n• <code>/deepscrape [url]</code>\n• <code>/setgroup [chat_id]</code>\n• <code>/creategroup [name]</code>\n\n<b>General:</b>\n• <code>/status</code> - Check status of an active deepscrape.\n• <code>/mydata</code> - View your current settings.\n• <code>/stop</code> or <code>/cancel</code> - Stop any active task.")
+    message = (f"Hi <b>{user.mention_html()}</b>! I am the fully operational Image Scraper Bot.\n\n<b>Single Scraping:</b>\n• <code>/scrape [url]</code>\n• <code>/settarget [chat_id]</code>\n\n<b>Deep Scraping (User Account Required for Setup):</b>\n• <code>/login</code> (Only for <code>/creategroup</code>)\n• <code>/deepscrape [url]</code>\n• <code>/setgroup [chat_id]</code>\n• <code>/creategroup [name]</code>\n\n<b>General:</b>\n• <code>/status</code> - Check status of an active deepscrape.\n• <code>/mydata</code> - View your current settings.\n• <code>/stop</code> or <code>/cancel</code> - Stop any active task.")
     await update.message.reply_html(message)
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await start_command(update, context)
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +139,7 @@ async def mydata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = await db.get_user_data(update.effective_user.id)
     target_chat = (ud or {}).get('target_chat_id', 'Not Set'); target_group = (ud or {}).get('target_group_id', 'Not Set')
     session_set = "Yes" if (ud or {}).get('session_string') else "No"
-    message = (f"<b>Your Settings:</b>\n\n👤 <b>Logged In:</b> {session_set}\n🎯 <b>Single Scrape Target:</b> <code>{target_chat}</code>\n🗂️ <b>Deep Scrape Target:</b> <code>{target_group}</code>")
+    message = (f"<b>Your Settings:</b>\n\n👤 <b>Logged In (for /creategroup):</b> {session_set}\n🎯 <b>Single Scrape Target:</b> <code>{target_chat}</code>\n🗂️ <b>Deep Scrape Target:</b> <code>{target_group}</code>")
     await update.message.reply_html(message)
 async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/settarget [chat_id]</code> or <code>/settarget me</code>")
@@ -153,24 +154,23 @@ async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.save_user_data(update.effective_user.id, {'target_chat_id': target_id})
     await update.message.reply_html(f"✅ Single scrape target set to <code>{target_id}</code>.")
 async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ud = await db.get_user_data(update.effective_user.id)
-    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first.")
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/setgroup [supergroup_id]</code>")
     group_id = context.args[0]
-    await update.message.reply_html(f"Verifying topic permissions for <code>{group_id}</code>...")
+    await update.message.reply_html(f"Verifying I am an admin in <code>{group_id}</code>...")
     try:
-        async with await get_userbot_client(ud['session_string']) as client:
-            entity = await client.get_entity(int(group_id))
-            test_topic = await client(functions.channels.CreateForumTopicRequest(channel=entity, title="-- Permission Check --", random_id=context.bot._get_private_random_id()))
-            await client(functions.channels.DeleteForumTopicRequest(channel=entity, topic_id=test_topic.updates[0].message.id))
+        chat_admins = await context.bot.get_chat_administrators(chat_id=group_id)
+        bot_is_admin = any(admin.user.id == context.bot.id for admin in chat_admins)
+        if not bot_is_admin:
+            return await update.message.reply_html(f"<b>Permission Denied!</b>\nI am not an administrator in that group. Please make me an admin with topic creation permissions.")
+        # Optional: Check for topic creation permission specifically if possible
     except Exception as e:
-        return await update.message.reply_html(f"<b>Permission Denied!</b>\nYour user account could not manage topics.\n<b>Error:</b> <code>{e}</code>")
+        return await update.message.reply_html(f"<b>Could not verify permissions.</b>\nMake sure the ID is correct and I am in the group.\n<b>Error:</b> <code>{e}</code>")
     await db.save_user_data(update.effective_user.id, {'target_group_id': group_id})
     await update.message.reply_html(f"✅ Deep scrape target group set to <code>{group_id}</code>.")
 
 # --- CORE LOGIC HANDLERS ---
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Please send your Telethon session string.")
+    await update.message.reply_text("Please send your Telethon session string. This is only needed for /creategroup.")
     return 'awaiting_session'
 
 async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,22 +245,26 @@ async def conv_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = await db.get_user_data(update.effective_user.id)
-    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first.")
+    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first for this command.")
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/creategroup [Your Group Name]</code>")
     group_name = " ".join(context.args)
-    await update.message.reply_html(f"Creating supergroup '<b>{group_name}</b>'...")
+    msg = await update.message.reply_html(f"Creating supergroup '<b>{group_name}</b>' with your user account...")
     try:
         async with await get_userbot_client(ud['session_string']) as client:
-            created_chat = await client(functions.messages.CreateChatRequest(users=["me"], title=group_name))
+            created_chat = await client(functions.messages.CreateChatRequest(users=[(await context.bot.get_me()).username], title=group_name))
             chat_id = created_chat.chats[0].id
             await client(functions.channels.ConvertToGigagroupRequest(channel=chat_id))
             full_channel = await client(functions.channels.GetFullChannelRequest(channel=chat_id))
             supergroup_id = int(f"-100{full_channel.full_chat.id}")
+            await client.edit_admin(entity=supergroup_id, user=context.bot.id, is_admin=True, manage_topics=True)
             await db.save_user_data(update.effective_user.id, {'target_group_id': str(supergroup_id)})
-            await update.message.reply_html(f"✅ Supergroup created & set as target!\n<b>Name:</b> {group_name}\n<b>ID:</b> <code>{supergroup_id}</code>")
-    except Exception as e: await update.message.reply_html(f"An error occurred: {e}")
+            await msg.edit_text(f"✅ Supergroup created & set as target!\nI have been made an admin.\n<b>Name:</b> {group_name}\n<b>ID:</b> <code>{supergroup_id}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e: await msg.edit_text(f"An error occurred: {e}", parse_mode=ParseMode.HTML)
 async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await db.get_user_active_task(update.effective_user.id): return await update.message.reply_html("You already have an active deepscrape task. Use /stop first.")
+    user_id = update.effective_user.id
+    ud = await db.get_user_data(user_id)
+    if await db.get_user_active_task(user_id): return await update.message.reply_html("You already have an active deepscrape task. Use /stop first.")
+    if not ud or not ud.get('target_group_id'): return await update.message.reply_html("❌ Deepscrape target group not set. Use /setgroup first.")
     if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/deepscrape [url]</code>")
     base_url = preprocess_url(context.args[0])
     msg = await update.message.reply_html(f"Scanning <code>{base_url}</code> for links...")
@@ -269,22 +273,19 @@ async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         soup = BeautifulSoup(links_response.content, 'html.parser')
         links = sorted(list({urljoin(base_url, a['href']) for a in soup.find_all('a', href=True) if urljoin(base_url, a.get('href', '')) != base_url and not (urljoin(base_url, a.get('href', ''))).endswith(('.zip', '.rar', '.exe', '.pdf'))}))
         if not links: return await msg.edit_text("Found no unique, valid links on that page to scrape.")
-        task_id = await db.create_task(update.effective_user.id, base_url, links)
+        task_id = await db.create_task(user_id, base_url, links)
         keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
         await msg.edit_text(f"Found {len(links)} links. Starting deep scrape in the background.\nTo cancel, use /stop.", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.application.create_task(_run_deepscrape_task(update.effective_user.id, task_id, context.application))
+        context.application.create_task(_run_deepscrape_task(user_id, task_id, context.application))
     except Exception as e: await msg.edit_text(f"Failed to fetch links from URL. Error: {e}")
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await db.get_user_active_task(update.effective_user.id)
     if not task: return await update.message.reply_html("No active deepscrape task found.")
     keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
     await update.message.reply_html("You have an active deepscrape task.", reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def _run_deepscrape_task(user_id, task_id, application: Application):
     ud = await db.get_user_data(user_id)
-    if not ud or 'session_string' not in ud:
-        await application.bot.send_message(user_id, "<b>Error:</b> You are not logged in. Stopping task.", parse_mode=ParseMode.HTML)
-        return
-
     target_group = ud.get('target_group_id')
     if not target_group:
         await application.bot.send_message(user_id, "<b>Error:</b> Deepscrape target group not set. Stopping task.", parse_mode=ParseMode.HTML)
@@ -293,80 +294,79 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
     await db.update_task_status(task_id, "running")
     await application.bot.send_message(user_id, "🚀 <b>Deepscrape task started!</b>", parse_mode=ParseMode.HTML)
     try:
-        async with await get_userbot_client(ud['session_string']) as client:
-            entity = await client.get_entity(int(target_group))
-            while True:
+        while True:
+            task = await db.tasks_collection.find_one({"_id": task_id})
+            if not task or task['status'] != 'running':
+                if task and task.get('status') == 'stopped':
+                    await application.bot.send_message(user_id, "🛑 <b>Deepscrape task has been stopped by user.</b>", parse_mode=ParseMode.HTML)
+                break
+
+            pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
+            if not pending_links:
+                await db.update_task_status(task_id, "completed")
+                await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b> All links processed.", parse_mode=ParseMode.HTML)
+                break
+
+            link = pending_links[0]
+            current_link_num = len(task['completed_links']) + 1
+            await db.update_task_counters(task_id, current_link_num - 1, link, 0)
+            await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
+
+            images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
+            task = await db.tasks_collection.find_one({"_id": task_id})
+            if task['status'] == 'stopped': break
+
+            if not images:
+                await db.complete_link_in_task(task_id, link)
+                await application.bot.send_message(user_id, f"Link {current_link_num} had no images. Moving to next.", parse_mode=ParseMode.HTML)
+                continue
+
+            await db.update_task_counters(task_id, current_link_num - 1, link, len(images))
+
+            topic_id = None
+            while not topic_id:
                 task = await db.tasks_collection.find_one({"_id": task_id})
-                if not task or task['status'] != 'running':
-                    if task and task.get('status') == 'stopped':
-                        await application.bot.send_message(user_id, "🛑 <b>Deepscrape task has been stopped by user.</b>", parse_mode=ParseMode.HTML)
-                    break
-
-                pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
-                if not pending_links:
-                    await db.update_task_status(task_id, "completed")
-                    await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b> All links processed.", parse_mode=ParseMode.HTML)
-                    break
-
-                link = pending_links[0]
-                current_link_num = len(task['completed_links']) + 1
-                await db.update_task_counters(task_id, current_link_num - 1, link, 0)
-                await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
-
-                images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
-                task = await db.tasks_collection.find_one({"_id": task_id}) # Re-fetch task state
                 if task['status'] == 'stopped': break
+                try:
+                    topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
+                    # BOT CREATES THE TOPIC NOW
+                    created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title)
+                    topic_id = created_topic.message_thread_id
+                    await application.bot.send_message(user_id, f"Created topic '<b>{topic_title}</b>' for link {current_link_num}.", parse_mode=ParseMode.HTML)
+                except RetryAfter as e:
+                    await db.update_task_status(task_id, "paused")
+                    await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Topic creation limit. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
+                    await asyncio.sleep(e.retry_after + 5)
+                    await db.update_task_status(task_id, "running")
+                except Exception as e:
+                    await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}. Ensure I have admin rights to manage topics. Stopping task.", parse_mode=ParseMode.HTML)
+                    await db.update_task_status(task_id, "paused")
+                    return
 
-                if not images:
-                    await db.complete_link_in_task(task_id, link)
-                    await application.bot.send_message(user_id, f"Link {current_link_num} had no images. Moving to next.", parse_mode=ParseMode.HTML)
-                    continue
+            if not topic_id: continue
 
-                await db.update_task_counters(task_id, current_link_num - 1, link, len(images))
-
-                topic_id = None
-                while not topic_id:
+            await application.bot.send_message(user_id, f"Found {len(images)} images for link {current_link_num}. Starting upload...")
+            for img_url in images:
+                while True:
                     task = await db.tasks_collection.find_one({"_id": task_id})
                     if task['status'] == 'stopped': break
                     try:
-                        topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
-                        topic_result = await client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=application.bot._get_private_random_id()))
-                        topic_id = topic_result.updates[0].message.id
-                        await application.bot.send_message(user_id, f"Created topic '<b>{topic_title}</b>' for link {current_link_num}.", parse_mode=ParseMode.HTML)
-                    except FloodWaitError as e:
+                        await application.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
+                        await db.increment_task_image_upload_count(task_id)
+                        break
+                    except RetryAfter as e:
                         await db.update_task_status(task_id, "paused")
-                        await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Flood wait. Resuming in {e.seconds + 5}s.", parse_mode=ParseMode.HTML)
-                        await asyncio.sleep(e.seconds + 5)
+                        await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Upload limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
+                        await asyncio.sleep(e.retry_after + 5)
                         await db.update_task_status(task_id, "running")
                     except Exception as e:
-                        await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}. Stopping task.", parse_mode=ParseMode.HTML)
-                        await db.update_task_status(task_id, "paused")
-                        return
+                        logger.warning(f"Failed to send photo {img_url}: {e}")
+                        break
+                if task['status'] == 'stopped': break
 
-                if not topic_id: continue
-
-                await application.bot.send_message(user_id, f"Found {len(images)} images for link {current_link_num}. Starting upload...")
-                for img_url in images:
-                    while True:
-                        task = await db.tasks_collection.find_one({"_id": task_id})
-                        if task['status'] == 'stopped': break
-                        try:
-                            await application.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
-                            await db.increment_task_image_upload_count(task_id)
-                            break
-                        except RetryAfter as e:
-                            await db.update_task_status(task_id, "paused")
-                            await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
-                            await asyncio.sleep(e.retry_after + 5)
-                            await db.update_task_status(task_id, "running")
-                        except Exception as e:
-                            logger.warning(f"Failed to send photo {img_url}: {e}")
-                            break # Skip this image on failure
-                    if task['status'] == 'stopped': break
-
-                if task['status'] == 'running':
-                    await db.complete_link_in_task(task_id, link)
-                    await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
+            if task['status'] == 'running':
+                await db.complete_link_in_task(task_id, link)
+                await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
 
     except Exception as e:
         logger.error(f"Error in _run_deepscrape_task: {e}", exc_info=True)
