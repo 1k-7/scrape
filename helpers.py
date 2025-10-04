@@ -2,6 +2,10 @@
 import os
 import re
 from urllib.parse import urlparse
+import asyncio
+import aiohttp
+import zipfile
+from io import BytesIO
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -10,33 +14,54 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 
 def get_url_from_message(message):
-    """Extracts the first URL from a message or its replied-to message."""
     text_to_check = ""
-    # Check current message text and caption
     if message.text:
         text_to_check += " " + message.text
     if message.caption:
         text_to_check += " " + message.caption
         
-    # Check replied-to message text and caption
     if message.reply_to_message:
         if message.reply_to_message.text:
             text_to_check += " " + message.reply_to_message.text
         if message.reply_to_message.caption:
             text_to_check += " " + message.reply_to_message.caption
 
-    # Regex to find the first http/https URL
     match = re.search(r'https?://[^\s/$.?#].[^\s]*', text_to_check)
     return match.group(0) if match else None
 
 def preprocess_url(url: str):
-    """Ensures a URL has a scheme (http or https)."""
     if not re.match(r'http(s)?://', url):
         return f'https://{url}'
     return url
 
 def get_userbot_client(session_string: str):
-    """Creates a Telethon client from a session string."""
     if not session_string:
         return None
     return TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
+
+async def fetch_image(session, url):
+    try:
+        async with session.get(url, timeout=30) as response:
+            if response.status == 200:
+                return await response.read()
+    except Exception as e:
+        print(f"Failed to fetch {url}: {e}")
+        return None
+
+async def create_zip_from_urls(urls: list) -> BytesIO | None:
+    zip_buffer = BytesIO()
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_image(session, url) for url in urls]
+        results = await asyncio.gather(*tasks)
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for i, image_bytes in enumerate(results):
+                if image_bytes:
+                    filename = f"image_{i+1:04d}.jpg"
+                    zip_file.writestr(filename, image_bytes)
+
+    if zip_buffer.getbuffer().nbytes > 22: # 22 is the size of an empty zip
+        zip_buffer.seek(0)
+        return zip_buffer
+    return None
