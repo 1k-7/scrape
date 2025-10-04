@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB_NAME]
 users_collection = db["users"]
-tasks_collection = db["tasks"]
-logger.info("Successfully connected to MongoDB.")
-
+tasks_collection = db["tasks"] # For stateful tasks
 
 # --- User Data Functions ---
 async def get_user_data(user_id: int) -> dict:
+    """Retrieves a user's data from the database."""
     return await users_collection.find_one({"_id": user_id})
 
 async def save_user_data(user_id: int, data_to_update: dict):
+    """Saves or updates a user's data in the database."""
     await users_collection.update_one(
         {"_id": user_id},
         {"$set": data_to_update},
@@ -52,7 +52,6 @@ async def create_task(user_id: int, base_url: str, all_links: list) -> str:
 async def get_user_active_task(user_id: int):
     """Finds a user's active (running or paused) task."""
     return await tasks_collection.find_one({"user_id": user_id, "status": {"$in": ["running", "paused"]}})
-
 
 async def update_task_progress(task_id, link: str, images: list):
     """Updates the current link and its scraped images."""
