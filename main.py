@@ -20,7 +20,7 @@ from handlers import (
     SELECTING_ACTION, AWAITING_LOGIN_SESSION, AWAITING_TARGET_NAME,
     AWAITING_TARGET_ID, CONFIRM_TARGET_DELETE, AWAITING_WORKER_TARGET,
     AWAITING_WORKER_TOKEN, CONFIRM_WORKER_DELETE, SCRAPE_SELECT_TARGET,
-    SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE,
+    SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE, SELECT_WORK_TARGET,
     start_command, stop_command, main_menu_callback,
     close_menu_callback, ping_callback, login_menu_callback,
     handle_login_session, logout_callback, targets_menu_callback,
@@ -31,7 +31,8 @@ from handlers import (
     delete_worker_callback, confirm_delete_worker_callback,
     scrape_command_entry, deepscrape_command_entry,
     scrape_select_target_callback, scrape_upload_as_callback,
-    scrape_link_range_callback, cancel_scrape_callback
+    scrape_link_range_callback, scrape_all_links_callback, cancel_scrape_callback,
+    work_command, select_work_target_callback
 )
 
 # --- Basic Configuration ---
@@ -49,6 +50,7 @@ def health_check(): return "Bot is alive!", 200
 def run_web_server(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 async def post_init_callback(application: Application):
+    """Post-initialization tasks like DB connection check and worker bot setup."""
     logger.info("Running post-initialization tasks...")
     try:
         await db.client.admin.command('ping'); logger.info("MongoDB connection successful.")
@@ -57,15 +59,17 @@ async def post_init_callback(application: Application):
     
     logger.info("Initializing worker bot fleet...")
     all_users = await db.users_collection.find({}).to_list(length=None)
-    unique_workers = {worker['token']: worker['id'] for user in all_users for worker in user.get('worker_bots', [])}
-    for token, bot_id in unique_workers.items():
+    unique_workers = {worker['token']: worker for user in all_users for worker in user.get('worker_bots', [])}
+    
+    for token, worker_data in unique_workers.items():
         try:
             bot_client = application.builder().token(token).build().bot
             await bot_client.get_me()
             WORKER_BOT_POOL[token] = bot_client
-            logger.info(f"Successfully initialized worker bot ID: {bot_id}")
+            logger.info(f"Successfully initialized worker bot: @{worker_data['username']} (ID: {worker_data['id']})")
         except Exception as e:
-            logger.error(f"Failed to initialize worker ID {bot_id}: {e}")
+            logger.error(f"Failed to initialize worker ID {worker_data['id']}: {e}")
+            
     logger.info(f"Worker bot fleet initialization complete. {len(WORKER_BOT_POOL)} workers ready.")
     application.bot_data["WORKER_BOT_POOL"] = WORKER_BOT_POOL
 
@@ -91,6 +95,7 @@ def main() -> None:
             CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"),
             CommandHandler("scrape", scrape_command_entry),
             CommandHandler("deepscrape", deepscrape_command_entry),
+            CommandHandler("work", work_command), # ADDED /work entry point
         ],
         states={
             SELECTING_ACTION: [
@@ -113,11 +118,22 @@ def main() -> None:
             AWAITING_WORKER_TARGET: [CallbackQueryHandler(select_target_for_worker_callback, pattern=r"^select_worker_target_")],
             AWAITING_WORKER_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_worker_tokens)],
             CONFIRM_WORKER_DELETE: [CallbackQueryHandler(confirm_delete_worker_callback, pattern=r"^confirm_delete_worker_")],
+            
+            # /work command flow
+            SELECT_WORK_TARGET: [CallbackQueryHandler(select_work_target_callback, pattern=r"^work_target_")],
+
+            # Scrape Workflow States
             SCRAPE_SELECT_TARGET: [CallbackQueryHandler(scrape_select_target_callback, pattern=r"^select_target_")],
             SCRAPE_UPLOAD_AS: [CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_")],
-            SCRAPE_LINK_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_link_range_callback)],
+            SCRAPE_LINK_RANGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_link_range_callback),
+                CommandHandler("all", scrape_all_links_callback) # ADDED /all handler
+            ],
         },
-        fallbacks=[CommandHandler("stop", stop_command), CallbackQueryHandler(cancel_scrape_callback, pattern="^cancel_scrape$")],
+        fallbacks=[
+            CommandHandler("stop", stop_command),
+            CallbackQueryHandler(cancel_scrape_callback, pattern="^cancel_scrape$")
+        ],
         persistent=True,
         name="main_ui_handler",
         allow_reentry=True,
