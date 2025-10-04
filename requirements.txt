@@ -10,3 +10,4 @@ motor
 pymongo
 dnspython
 Flask
+aiohttp
