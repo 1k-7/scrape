@@ -192,7 +192,14 @@ async def addworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     added_workers, failed_workers = [], []
     
     target_group_id = int(ud.get('target_group_id'))
-    admin_rights = ChatAdminRights(post_messages=True, edit_messages=True, delete_messages=True)
+    # --- THIS IS THE FIX: A more comprehensive and correct set of admin rights ---
+    admin_rights = ChatAdminRights(
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        manage_topics=True,  # Important for topic-based groups
+        # We don't need other rights like banning users, etc.
+    )
 
     async with await get_userbot_client(ud['session_string']) as client:
         for token in context.args:
@@ -202,17 +209,14 @@ async def addworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 
                 await msg.edit_text(f"Resolving, inviting, and promoting @{worker_info.username}...")
                 
-                # --- THIS IS THE FIX ---
-                # Resolve the bot's username to an entity to get its access hash
                 worker_entity = await client.get_input_entity(worker_info.username)
                 
                 try:
-                    # Invite the resolved entity
                     await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_entity]))
                 except UserAlreadyParticipantError:
-                    pass # Bot is already in the group, that's fine
+                    pass
 
-                # Promote the resolved entity
+                # Promote the bot using the new, more complete admin rights
                 await client(functions.channels.EditAdminRequest(target_group_id, worker_entity, admin_rights, "Worker Bot"))
                 
                 worker_data = {"id": worker_info.id, "username": worker_info.username, "token": token}
@@ -470,10 +474,7 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
                         await asyncio.sleep(e.retry_after + 2) # Rest this worker
                     except Exception as e:
                         logger.error(f"Worker {worker_id} failed to send {img_url}: {e}")
-                        # Optionally, put the image back in the queue
-                        # image_queue.append(img_url)
 
-            # Create and run tasks for all workers concurrently
             upload_tasks = [upload_worker(bot, i) for i, bot in enumerate(worker_clients)]
             await asyncio.gather(*upload_tasks)
 
