@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 # 1. MAIN MENU & CORE COMMANDS
 # =============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the /start command and displays the main menu."""
     ud = await db.get_user_data(update.effective_user.id)
     session_status = "✅ Logged In" if ud and 'session_string' in ud else "❌ Not Logged In"
     keyboard = [[InlineKeyboardButton("⚙️ Open Settings Menu", callback_data="main_menu")]]
@@ -53,7 +52,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Displays the main settings menu."""
     query = update.callback_query
     await query.answer()
     ud = await db.get_user_data(query.from_user.id)
@@ -78,14 +76,12 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return SELECTING_ACTION
 
 async def close_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Closes the settings menu."""
     await update.callback_query.answer()
     await update.callback_query.edit_message_text("Settings menu closed.")
     context.user_data.clear()
     return ConversationHandler.END
 
 async def ping_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the ping command to check bot latency."""
     start_time = datetime.now()
     await update.callback_query.answer("Pinging...")
     end_time = datetime.now()
@@ -95,7 +91,6 @@ async def ping_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return SELECTING_ACTION
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Stops any active deepscrape task and clears user data."""
     task = await db.get_user_active_task(update.effective_user.id)
     if task:
         await db.update_task_status(task['_id'], "stopped")
@@ -450,6 +445,29 @@ async def scrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return SCRAPE_SELECT_TARGET
 
+async def scrape_select_target_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['target_id'] = query.data.split('_', 2)[2]
+    
+    keyboard = [
+        [InlineKeyboardButton("🖼️ As Photos", callback_data="upload_as_photo")],
+        [InlineKeyboardButton("📄 As Documents", callback_data="upload_as_document")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_scrape")]
+    ]
+    await query.edit_message_text("How should the images be uploaded?", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    return SCRAPE_UPLOAD_AS
+
+async def scrape_upload_as_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['upload_as'] = query.data.split('_', 2)[2]
+    
+    await query.edit_message_text("Starting single scrape...")
+    await start_single_scrape(update, context)
+    return ConversationHandler.END
+
 async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = get_url_from_message(update.message)
     if not url:
@@ -630,7 +648,7 @@ async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_user.id, url, all_links, target_ids, upload_as, link_range, msg.message_id
     )
     
-    await msg.edit_text(f"Deep scrape has started in the background. Use /stop to cancel.")
+    await msg.edit_message_text(f"Deep scrape has started in the background. Use /stop to cancel.")
     
     context.application.create_task(
         run_deepscrape_task(
