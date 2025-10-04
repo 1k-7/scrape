@@ -21,6 +21,7 @@ from handlers import (
     AWAITING_TARGET_ID, CONFIRM_TARGET_DELETE, AWAITING_WORKER_TARGET,
     AWAITING_WORKER_TOKEN, CONFIRM_WORKER_DELETE, SCRAPE_SELECT_TARGET,
     SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE, SELECT_WORK_TARGET,
+    SELECT_MULTIPLE_TARGETS,
     start_command, stop_command, main_menu_callback,
     close_menu_callback, ping_callback, login_menu_callback,
     handle_login_session, logout_callback, targets_menu_callback,
@@ -32,7 +33,9 @@ from handlers import (
     scrape_command_entry, deepscrape_command_entry,
     scrape_select_target_callback, scrape_upload_as_callback,
     scrape_link_range_callback, scrape_all_links_callback, cancel_scrape_callback,
-    work_command, select_work_target_callback
+    work_command, select_work_target_callback,
+    select_multiple_targets_callback, toggle_upload_option_callback,
+    confirm_upload_options_callback
 )
 
 # --- Basic Configuration ---
@@ -50,7 +53,6 @@ def health_check(): return "Bot is alive!", 200
 def run_web_server(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 async def post_init_callback(application: Application):
-    """Post-initialization tasks like DB connection check and worker bot setup."""
     logger.info("Running post-initialization tasks...")
     try:
         await db.client.admin.command('ping'); logger.info("MongoDB connection successful.")
@@ -75,7 +77,6 @@ async def post_init_callback(application: Application):
 
 
 def main() -> None:
-    """Run the bot."""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable not set.")
         sys.exit(1)
@@ -95,7 +96,7 @@ def main() -> None:
             CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"),
             CommandHandler("scrape", scrape_command_entry),
             CommandHandler("deepscrape", deepscrape_command_entry),
-            CommandHandler("work", work_command), # ADDED /work entry point
+            CommandHandler("work", work_command),
         ],
         states={
             SELECTING_ACTION: [
@@ -119,15 +120,21 @@ def main() -> None:
             AWAITING_WORKER_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_worker_tokens)],
             CONFIRM_WORKER_DELETE: [CallbackQueryHandler(confirm_delete_worker_callback, pattern=r"^confirm_delete_worker_")],
             
-            # /work command flow
             SELECT_WORK_TARGET: [CallbackQueryHandler(select_work_target_callback, pattern=r"^work_target_")],
 
-            # Scrape Workflow States
+            # Single Scrape Workflow
             SCRAPE_SELECT_TARGET: [CallbackQueryHandler(scrape_select_target_callback, pattern=r"^select_target_")],
-            SCRAPE_UPLOAD_AS: [CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_")],
+            
+            # Deep Scrape Workflow
             SCRAPE_LINK_RANGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_link_range_callback),
-                CommandHandler("all", scrape_all_links_callback) # ADDED /all handler
+                CommandHandler("all", scrape_all_links_callback)
+            ],
+            SELECT_MULTIPLE_TARGETS: [CallbackQueryHandler(select_multiple_targets_callback, pattern=r"^multi_target_")],
+            SCRAPE_UPLOAD_AS: [
+                CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_"), # For single scrape
+                CallbackQueryHandler(toggle_upload_option_callback, pattern=r"^toggle_"), # For deepscrape multi-select
+                CallbackQueryHandler(confirm_upload_options_callback, pattern="^confirm_upload_options") # For deepscrape multi-select
             ],
         },
         fallbacks=[
