@@ -431,7 +431,9 @@ async def select_work_target_callback(update: Update, context: ContextTypes.DEFA
         for worker in workers:
             try:
                 await query.edit_message_text(f"Processing @{worker['username']}...")
-                worker_entity = await client.get_input_entity(worker['id'])
+                # *** THIS IS THE FIX ***
+                # Use the username to find the bot, which is more reliable than the ID.
+                worker_entity = await client.get_input_entity(worker['username'])
                 try:
                     await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_entity]))
                 except UserAlreadyParticipantError:
@@ -524,7 +526,6 @@ async def scrape_upload_as_callback(update: Update, context: ContextTypes.DEFAUL
     context.user_data['upload_as'] = query.data.split('_', 2)[2]
     
     if context.user_data['scrape_type'] == 'deep':
-        # MODIFIED: Changed prompt to include clickable /all command
         await query.edit_message_text("Please specify the range of links to process (e.g., `1-77`)\n\nor use /all to process all links.")
         return SCRAPE_LINK_RANGE
     else:
