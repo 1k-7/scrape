@@ -1,40 +1,40 @@
 # main.py
 import logging
 import os
-import threading
 import sys
+import threading
 
 from dotenv import load_dotenv
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters,
+    CommandHandler,
     ConversationHandler,
+    MessageHandler,
     PicklePersistence,
-)
-
-from handlers import (
-    start_command, stop_command,
-    main_menu_callback, close_menu_callback, ping_callback,
-    login_menu_callback, handle_login_session, logout_callback,
-    targets_menu_callback, add_target_callback, handle_target_name, handle_target_id,
-    delete_target_callback, confirm_delete_target_callback,
-    workers_menu_callback, add_worker_callback, select_target_for_worker_callback,
-    handle_worker_tokens, delete_worker_callback, confirm_delete_worker_callback,
-    scrape_command_entry, deepscrape_command_entry,
-    scrape_select_target_callback, scrape_upload_as_callback, scrape_link_range_callback,
-    cancel_scrape_callback,
-    SELECTING_ACTION, AWAITING_TARGET_NAME, AWAITING_TARGET_ID,
-    AWAITING_WORKER_TOKEN, AWAITING_LOGIN_SESSION,
-    SCRAPE_SELECT_TARGET, SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE,
-    CONFIRM_TARGET_DELETE, CONFIRM_WORKER_DELETE, AWAITING_WORKER_TARGET
+    filters,
 )
 
 import database as db
+from handlers import (
+    SELECTING_ACTION, AWAITING_LOGIN_SESSION, AWAITING_TARGET_NAME,
+    AWAITING_TARGET_ID, CONFIRM_TARGET_DELETE, AWAITING_WORKER_TARGET,
+    AWAITING_WORKER_TOKEN, CONFIRM_WORKER_DELETE, SCRAPE_SELECT_TARGET,
+    SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE,
+    start_command, stop_command, main_menu_callback,
+    close_menu_callback, ping_callback, login_menu_callback,
+    handle_login_session, logout_callback, targets_menu_callback,
+    add_target_callback, handle_target_name, handle_target_id,
+    delete_target_callback, confirm_delete_target_callback,
+    workers_menu_callback, add_worker_callback,
+    select_target_for_worker_callback, handle_worker_tokens,
+    delete_worker_callback, confirm_delete_worker_callback,
+    scrape_command_entry, deepscrape_command_entry,
+    scrape_select_target_callback, scrape_upload_as_callback,
+    scrape_link_range_callback, cancel_scrape_callback
+)
 
-# --- Basic Configuration & Global Pool ---
+# --- Basic Configuration ---
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
@@ -85,10 +85,6 @@ def main() -> None:
         .build()
     )
 
-    # Handlers for commands outside the main UI flow
-    application.add_handler(CommandHandler("stop", stop_command))
-
-    # Master ConversationHandler for the entire UI and command workflows
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_command),
@@ -128,6 +124,7 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("stop", stop_command))
 
     logger.info("Bot is starting polling...")
     application.run_polling()
