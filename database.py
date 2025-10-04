@@ -28,7 +28,7 @@ async def create_task(user_id: int, base_url: str, all_links: list) -> str:
         "status": "running",
         "total_links": len(all_links),
         "current_link_index": 0,
-        "current_link_url": None,
+        "current_link_url": "Initializing...",
         "current_link_images_found": 0,
         "current_link_images_uploaded": 0,
         "all_links": all_links,
