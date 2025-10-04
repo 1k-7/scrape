@@ -30,7 +30,6 @@ from telegram.error import RetryAfter, BadRequest
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
 import database as db
@@ -68,55 +67,136 @@ def get_file_extension(url: str):
 
 # --- Hyper-Aggressive Scraping Logic ---
 def setup_selenium_driver():
+    """Initializes the Selenium WebDriver, pointing to the pre-installed chromedriver."""
+    logger.info("Setting up Selenium driver...")
+    service = Service(executable_path="/usr/bin/chromedriver")
+    
     chrome_options = Options()
     chrome_options.binary_location = "/usr/bin/google-chrome"
-    chrome_options.add_argument("--headless"); chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage"); chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1200")
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    
+    try:
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        logger.info("Selenium driver setup successful.")
+        return driver
+    except Exception as e:
+        logger.critical(f"CRITICAL: Failed to setup Selenium driver: {e}", exc_info=True)
+        return None
 
 def scrape_images_from_url_sync(url: str, user_data: dict):
-    """Synchronous, thread-safe, hyper-aggressive scraping function."""
+    """Synchronous, thread-safe, hyper-aggressive scraping function with detailed logging and advanced image detection."""
+    logger.info(f"Starting HYPER-AGGRESSIVE scrape for URL: {url}")
     driver = setup_selenium_driver()
+    if not driver:
+        logger.error(f"Driver not available. Aborting scrape for {url}.")
+        return set()
+
     images = set()
     try:
+        logger.info(f"Driver getting URL: {url}")
         driver.get(url)
-        popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes', 'i agree']
-        js_script = f"var keywords = {popup_keywords}; var buttons = document.querySelectorAll('button, a, div, span'); var clicked = false; for (var i = 0; i < buttons.length; i++) {{ var buttonText = buttons[i].innerText.toLowerCase(); for (var j = 0; j < keywords.length; j++) {{ if (buttonText.includes(keywords[j])) {{ buttons[i].click(); clicked = true; break; }} }} if (clicked) break; }} return clicked;"
-        try:
-            if driver.execute_script(js_script): logger.info(f"Clicked a popup on {url}."); time.sleep(3)
-        except Exception as e: logger.warning(f"Popup click script failed: {e}")
+        logger.info(f"Driver finished getting URL. Waiting for initial load.")
+        time.sleep(3) # Wait for any initial dynamic content to load
 
+        # --- Popup clicking logic ---
+        popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes', 'i agree']
+        js_popup_script = f"var keywords = {popup_keywords}; var buttons = document.querySelectorAll('button, a, div, span'); var clicked = false; for (var i = 0; i < buttons.length; i++) {{ var buttonText = buttons[i].innerText.toLowerCase(); for (var j = 0; j < keywords.length; j++) {{ if (buttonText.includes(keywords[j])) {{ buttons[i].click(); clicked = true; break; }} }} if (clicked) break; }} return clicked;"
+        try:
+            if driver.execute_script(js_popup_script): logger.info(f"Clicked a popup on {url}."); time.sleep(3)
+        except Exception as e: logger.warning(f"Popup click script failed for {url}: {e}")
+        
+        # --- Aggressive scrolling to trigger lazy loading ---
+        logger.info(f"Starting to scroll and find images on {url}")
         last_height = driver.execute_script("return document.body.scrollHeight")
-        last_image_count, stable_count = 0, 0
-        while stable_count < 5:
+        stable_count = 0
+        scroll_attempts = 0
+        while stable_count < 3 and scroll_attempts < 15: # Limit scrolls to prevent infinite loops
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2.5)
+            time.sleep(2) # Give time for images to load
             new_height = driver.execute_script("return document.body.scrollHeight")
-            current_images = driver.find_elements(By.TAG_NAME, "img")
-            current_image_count = len([img for img in current_images if img.get_attribute('src')])
-            if new_height == last_height and current_image_count == last_image_count:
+            if new_height == last_height:
                 stable_count += 1
             else:
                 stable_count = 0
-            last_height = new_height; last_image_count = current_image_count
-            if not user_data.get('is_scraping', True): break
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        for tag in soup.find_all("img"):
-            src = tag.get("src") or tag.get("data-src")
-            if src and src.strip(): images.add(urljoin(url, src.strip()))
-        for tag in soup.find_all("a"):
-            href = tag.get("href")
-            if href and re.search(r'\.(jpeg|jpg|png|gif|webp|bmp)$', href, re.I): images.add(urljoin(url, href.strip()))
-        for tag in soup.find_all("source"):
-             srcset = tag.get("srcset")
-             if srcset and srcset.strip(): images.add(urljoin(url, srcset.strip().split(',')[0].split(' ')[0]))
+            last_height = new_height
+            scroll_attempts += 1
+            if not user_data.get('is_scraping', True): 
+                logger.info("Scraping stopped by user flag.")
+                break
+        logger.info(f"Scrolling finished after {scroll_attempts} attempts.")
+
+        # --- Advanced Image Extraction with JavaScript ---
+        logger.info(f"Executing advanced image extraction script on {url}.")
+        js_extraction_script = """
+            const urls = new Set();
+            const imageExtensions = /\.(jpeg|jpg|png|gif|webp|bmp|svg)$/i;
+
+            // 1. Get all <img> tags and their potential sources
+            document.querySelectorAll('img').forEach(img => {
+                if (img.src) urls.add(img.src);
+                if (img.dataset.src) urls.add(img.dataset.src);
+                if (img.dataset.lazySrc) urls.add(img.dataset.lazySrc);
+                if (img.dataset.fallbackSrc) urls.add(img.dataset.fallbackSrc);
+                if (img.srcset) {
+                    img.srcset.split(',').forEach(part => {
+                        urls.add(part.trim().split(' ')[0]);
+                    });
+                }
+            });
+
+            // 2. Get all <a> tags linking to images
+            document.querySelectorAll('a').forEach(a => {
+                if (a.href && imageExtensions.test(a.href)) {
+                    urls.add(a.href);
+                }
+            });
+            
+            // 3. Get all <source> tags
+            document.querySelectorAll('source').forEach(source => {
+                 if (source.srcset) {
+                    source.srcset.split(',').forEach(part => {
+                        urls.add(part.trim().split(' ')[0]);
+                    });
+                }
+            });
+
+            // 4. Find background images from all elements
+            document.querySelectorAll('*').forEach(el => {
+                const style = window.getComputedStyle(el, null).getPropertyValue('background-image');
+                if (style && style.includes('url')) {
+                    const match = style.match(/url\\(["']?([^"']*)["']?\\)/);
+                    if (match && match[1]) {
+                        urls.add(match[1]);
+                    }
+                }
+            });
+
+            return Array.from(urls);
+        """
+        extracted_urls = driver.execute_script(js_extraction_script)
+        logger.info(f"JS script extracted {len(extracted_urls)} potential URLs.")
+        
+        # Process and resolve URLs in Python
+        for img_url in extracted_urls:
+            if img_url and img_url.strip():
+                images.add(urljoin(url, img_url.strip()))
+
+        logger.info(f"Found {len(images)} potential images on {url}.")
     except Exception as e:
         logger.error(f"Error scraping {url}: {e}", exc_info=True)
     finally:
+        logger.info(f"Quitting driver for {url}.")
         driver.quit()
-    return {img for img in images if img and img.startswith('http')}
+    
+    # Final cleanup
+    final_images = {img for img in images if img and img.startswith('http') and not img.startswith('data:image')}
+    logger.info(f"Returning {len(final_images)} valid, absolute image URLs from {url}.")
+    return final_images
+
 
 # --- UTILITY & PERMISSION COMMANDS ---
 async def get_userbot_client(session_string: str):
@@ -162,7 +242,6 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_is_admin = any(admin.user.id == context.bot.id for admin in chat_admins)
         if not bot_is_admin:
             return await update.message.reply_html(f"<b>Permission Denied!</b>\nI am not an administrator in that group. Please make me an admin with topic creation permissions.")
-        # Optional: Check for topic creation permission specifically if possible
     except Exception as e:
         return await update.message.reply_html(f"<b>Could not verify permissions.</b>\nMake sure the ID is correct and I am in the group.\n<b>Error:</b> <code>{e}</code>")
     await db.save_user_data(update.effective_user.id, {'target_group_id': group_id})
@@ -329,7 +408,6 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
                 if task['status'] == 'stopped': break
                 try:
                     topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
-                    # BOT CREATES THE TOPIC NOW
                     created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title)
                     topic_id = created_topic.message_thread_id
                     await application.bot.send_message(user_id, f"Created topic '<b>{topic_title}</b>' for link {current_link_num}.", parse_mode=ParseMode.HTML)
