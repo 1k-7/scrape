@@ -25,7 +25,7 @@ async def create_task(user_id: int, base_url: str, all_links: list) -> str:
     task = {
         "user_id": user_id,
         "base_url": base_url,
-        "status": "running",
+        "status": "pending", # Start as pending
         "total_links": len(all_links),
         "current_link_index": 0,
         "current_link_url": "Initializing...",
