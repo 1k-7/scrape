@@ -200,12 +200,20 @@ async def addworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 worker_bot = ExtBot(token=token)
                 worker_info = await worker_bot.get_me()
                 
-                await msg.edit_text(f"Inviting and promoting @{worker_info.username}...")
+                await msg.edit_text(f"Resolving, inviting, and promoting @{worker_info.username}...")
+                
+                # --- THIS IS THE FIX ---
+                # Resolve the bot's username to an entity to get its access hash
+                worker_entity = await client.get_input_entity(worker_info.username)
+                
                 try:
-                    await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_info.id]))
+                    # Invite the resolved entity
+                    await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_entity]))
                 except UserAlreadyParticipantError:
                     pass # Bot is already in the group, that's fine
-                await client(functions.channels.EditAdminRequest(target_group_id, worker_info.id, admin_rights, "Worker Bot"))
+
+                # Promote the resolved entity
+                await client(functions.channels.EditAdminRequest(target_group_id, worker_entity, admin_rights, "Worker Bot"))
                 
                 worker_data = {"id": worker_info.id, "username": worker_info.username, "token": token}
                 await db.add_worker_bots(user_id, [worker_data])
@@ -288,7 +296,6 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Please send your Telethon session string.")
     return 'awaiting_session'
-# ... (scrape_command, status_callback, etc. are largely unchanged)
 async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
     try:
@@ -407,13 +414,9 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
     worker_bots_data = await db.get_worker_bots(user_id)
     worker_clients = [ExtBot(token=w['token']) for w in worker_bots_data]
     
-    # Use main bot as fallback if no workers are configured
     if not worker_clients:
         worker_clients.append(application.bot)
-        await application.bot.send_message(user_id, "⚠️ No worker bots found. Using main bot for uploads. This may be slow.")
-
-    worker_pool = deque(worker_clients)
-    resting_workers = {} # {bot_id: unban_timestamp}
+        await application.bot.send_message(user_id, "⚠️ No worker bots found. Using main bot for uploads.")
 
     await db.update_task_status(task_id, "running")
     await application.bot.send_message(user_id, f"🚀 <b>Deepscrape task started with {len(worker_clients)} uploader(s)!</b>", parse_mode=ParseMode.HTML)
@@ -433,6 +436,7 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
             await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
             
             images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
+            task = await db.tasks_collection.find_one({"_id": task_id}) # Re-fetch task state
             if task.get('status') == 'stopped': break
             if not images:
                 await db.complete_link_in_task(task_id, link); continue
@@ -448,31 +452,32 @@ async def _run_deepscrape_task(user_id, task_id, application: Application):
             
             await application.bot.send_message(user_id, f"Found {len(images)} images. Starting upload with worker fleet...")
             
-            upload_tasks = []
             image_queue = deque(images)
-
-            async def upload_worker(worker_bot):
-                while image_queue:
+            
+            async def upload_worker(worker_bot: ExtBot, worker_id: int):
+                while True:
                     try:
                         img_url = image_queue.popleft()
                     except IndexError:
-                        break # Queue is empty
+                        break # Queue is empty for this worker
                     
                     try:
                         await worker_bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
                         await db.increment_task_image_upload_count(task_id)
                     except RetryAfter as e:
-                        logger.warning(f"Worker @{worker_bot.username} hit flood wait for {e.retry_after}s. Resting.")
-                        image_queue.appendleft(img_url) # Put image back
-                        await asyncio.sleep(e.retry_after + 2)
+                        logger.warning(f"Worker {worker_id} hit flood wait for {e.retry_after}s. Resting.")
+                        image_queue.append(img_url) # Put image at the end of the queue for another worker
+                        await asyncio.sleep(e.retry_after + 2) # Rest this worker
                     except Exception as e:
-                        logger.error(f"Worker @{worker_bot.username} failed to send {img_url}: {e}")
-            
-            for worker in worker_clients:
-                upload_tasks.append(asyncio.create_task(upload_worker(worker)))
-            
+                        logger.error(f"Worker {worker_id} failed to send {img_url}: {e}")
+                        # Optionally, put the image back in the queue
+                        # image_queue.append(img_url)
+
+            # Create and run tasks for all workers concurrently
+            upload_tasks = [upload_worker(bot, i) for i, bot in enumerate(worker_clients)]
             await asyncio.gather(*upload_tasks)
 
+            task = await db.tasks_collection.find_one({"_id": task_id}) # Re-fetch task state
             if task.get('status') == 'running':
                 await db.complete_link_in_task(task_id, link)
                 await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
