@@ -10,7 +10,6 @@ import sys
 import traceback
 import time
 import random
-from datetime import datetime
 
 from flask import Flask
 import requests
@@ -26,7 +25,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, CallbackQueryHandler, PicklePersistence, ConversationHandler, ExtBot
 )
-from telegram.constants import ParseMode, ChatType
+from telegram.constants import ParseMode
 from telegram.error import RetryAfter, BadRequest
 
 from selenium import webdriver
@@ -39,57 +38,64 @@ from selenium.webdriver.common.action_chains import ActionChains
 
 import database as db
 
-# --- Basic Configuration & Global Pool ---
+# --- Basic Configuration ---
 load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
 BOT_TOKEN, API_ID, API_HASH = os.getenv("BOT_TOKEN"), os.getenv("API_ID"), os.getenv("API_HASH")
+
+# --- Global Worker Bot Pool ---
+# This dictionary will hold pre-initialized worker bot clients to prevent auth floodwaits.
+# It's populated once on startup.
 WORKER_BOT_POOL = {}
 
-# --- Conversation Handler States ---
-(SELECTING_ACTION, AWAITING_INPUT, CONFIRM_DELETION,
- SCRAPE_SELECT_TARGET, SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE,
- AWAITING_URL) = range(7)
-
-# --- Flask & Startup ---
+# --- Flask & Startup Checks ---
 app = Flask(__name__)
 @app.route('/')
 def health_check(): return "Bot is alive!", 200
 def run_web_server(): app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 async def post_init_callback(application: Application):
+    """Runs once on startup. Initializes DB and pre-authorizes all worker bots."""
     logger.info("Running post-initialization tasks...")
+    # 1. Check MongoDB connection
     try:
         await db.client.admin.command('ping'); logger.info("MongoDB connection successful.")
     except Exception as e:
-        logger.critical(f"CRITICAL: Could not connect to MongoDB: {e}"); sys.exit(1)
+        logger.critical(f"CRITICAL: Could not connect to MongoDB. Shutting down. Error: {e}"); sys.exit(1)
     
+    # 2. Pre-initialize all unique worker bots from the database
     logger.info("Initializing worker bot fleet...")
     all_users = await db.users_collection.find({}).to_list(length=None)
-    unique_workers = {worker['token']: worker['id'] for user in all_users for worker in user.get('worker_bots', [])}
-    for token, bot_id in unique_workers.items():
+    unique_workers = {}
+    for user in all_users:
+        for worker in user.get('worker_bots', []):
+            unique_workers[worker['token']] = worker['id']
+            
+    for token in unique_workers.keys():
         try:
             bot_client = ExtBot(token=token)
-            await bot_client.get_me()
+            await bot_client.get_me() # Authorize the bot
             WORKER_BOT_POOL[token] = bot_client
-            logger.info(f"Successfully initialized worker bot ID: {bot_id}")
+            logger.info(f"Successfully initialized worker bot ID: {unique_workers[token]}")
         except Exception as e:
-            logger.error(f"Failed to initialize worker ID {bot_id}: {e}")
-    logger.info(f"Worker bot fleet initialization complete. {len(WORKER_BOT_POOL)} workers ready.")
+            logger.error(f"Failed to initialize worker with token starting '{token[:8]}...': {e}")
+    logger.info(f"Worker bot fleet initialization complete. {len(WORKER_BOT_POOL)} workers are ready.")
+
 
 # --- Helper Functions ---
-def get_url_from_message(message):
-    if message.text:
-        url = find_url_in_text(message.text)
-        if url: return url
-    if message.reply_to_message and message.reply_to_message.text:
-        return find_url_in_text(message.reply_to_message.text)
-    return None
-
+def preprocess_url(url: str):
+    if not re.match(r'http(s)?://', url): return f'https://{url}'
+    return url
 def find_url_in_text(text: str):
     if not text: return None
     match = re.search(r'https?://[^\s/$.?#].[^\s]*', text)
     return match.group(0) if match else None
+def get_file_extension(url: str):
+    try:
+        path = urlparse(url).path; ext = os.path.splitext(path)[1][1:].lower(); return ext.split('?')[0]
+    except: return ""
+
 def get_max_quality_url(url):
     if not url: return None
     patterns = [
@@ -103,22 +109,23 @@ def get_max_quality_url(url):
     parsed_url = urlparse(cleaned_url)
     cleaned_url = urlunparse(parsed_url._replace(query='', fragment=''))
     return cleaned_url
-def get_userbot_client(session_string: str):
-    if not session_string: return None
-    return TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
 
-# --- Scraping Logic ---
+# --- Hyper-Aggressive Scraping Logic ---
 def setup_selenium_driver():
+    logger.info("Setting up Selenium driver...")
     service = Service(executable_path="/usr/bin/chromedriver")
-    options = Options()
-    options.binary_location = "/usr/bin/google-chrome"
-    options.add_argument("--headless"); options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage"); options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1200")
+    chrome_options = Options()
+    chrome_options.binary_location = "/usr/bin/google-chrome"
+    chrome_options.add_argument("--headless"); chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage"); chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1200")
     try:
-        return webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        logger.info("Selenium driver setup successful.")
+        return driver
     except Exception as e:
-        logger.critical(f"Failed to setup Selenium driver: {e}"); return None
+        logger.critical(f"CRITICAL: Failed to setup Selenium driver: {e}", exc_info=True)
+        return None
 
 def scrape_images_from_url_sync(url: str, user_data: dict):
     logger.info(f"Starting MAX-QUALITY scrape for URL: {url}")
@@ -149,304 +156,355 @@ def scrape_images_from_url_sync(url: str, user_data: dict):
         driver.quit()
     return {img for img in images if img and img.startswith('http')}
 
-# ... (All new UI, commands, and workflows are implemented below)
-# Note: This is a very large refactor. The code is structured into logical sections.
-
-# =============================================================================
-# 1. MAIN MENU & CORE COMMANDS
-# =============================================================================
+# --- UTILITY, PERMISSION & WORKER COMMANDS ---
+async def get_userbot_client(session_string: str):
+    if not session_string: return None
+    client = TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
+    await client.connect(); return client
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = (f"Hi <b>{update.effective_user.mention_html()}</b>!\n\n"
+               "<b>Core Commands:</b>\n"
+               "• `/scrape [url]`\n• `/deepscrape [url]`\n\n"
+               "<b>Setup Commands:</b>\n"
+               "• `/settarget [chat_id]`\n• `/setgroup [group_id]`\n"
+               "• `/login` (Needed for worker/group setup)\n\n"
+               "<b>Worker Bot Fleet:</b>\n"
+               "• `/addworkers [tokens]` (Automatic promotion)\n"
+               "• `/listworkers` & `/removeworkers [ids]`\n\n"
+               "<b>Other:</b> `/status`, `/mydata`, `/stop`")
+    await update.message.reply_html(message)
+
+async def addworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ud = await db.get_user_data(user_id)
-    session_status = "✅ Logged In" if ud and 'session_string' in ud else "❌ Not Logged In"
-    
-    keyboard = [
-        [InlineKeyboardButton("🎯 Manage Targets", callback_data="targets_menu")],
-        [InlineKeyboardButton("🤖 Manage Workers", callback_data="workers_menu")],
-        [InlineKeyboardButton("👤 Login / Status", callback_data="login_menu")],
-        [InlineKeyboardButton("ヘル Ping", callback_data="ping")],
-    ]
-    
-    await update.message.reply_html(
-        f"Hi <b>{update.effective_user.mention_html()}</b>! I'm ready to scrape.\n\n"
-        f"Your Login Status: {session_status}\n\n"
-        "Use `/scrape` or `/deepscrape` (or reply with them) on a URL.\n\n"
-        "Manage your settings below:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_time = datetime.now()
-    msg = await update.message.reply_html("<b>Pinging...</b>")
-    end_time = datetime.now()
-    latency = round((end_time - start_time).total_seconds() * 1000)
-    await msg.edit_text(f"<b>Pong!</b>\nLatency: {latency} ms")
-
-async def ping_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_time = datetime.now()
-    await update.callback_query.answer("Pinging...")
-    end_time = datetime.now()
-    latency = round((end_time - start_time).total_seconds() * 1000)
-    await update.callback_query.answer(f"Pong! Latency: {latency} ms", show_alert=True)
-
-
-# =============================================================================
-# 2. TARGET MANAGEMENT
-# =============================================================================
-
-async def targets_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    targets = await db.get_targets(user_id)
-    
-    keyboard = [[InlineKeyboardButton(f"🗑️ {t['name']}", callback_data=f"delete_target_{t['id']}")] for t in targets]
-    keyboard.append([InlineKeyboardButton("➕ Add New Target", callback_data="add_target")])
-    keyboard.append([InlineKeyboardButton("« Back", callback_data="start_over")])
-    
-    await query.edit_message_text(
-        "<b>🎯 Target Management</b>\n\nHere are your saved targets. You can add new ones or remove existing ones.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    return SELECTING_ACTION
-
-async def add_target_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Please send me the name for this new target (e.g., 'My Main Group').")
-    return AWAITING_INPUT
-
-async def handle_target_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['target_name'] = update.message.text
-    await update.message.reply_text("Great. Now send me the Chat ID for this target (e.g., -100123456789 or 'me').")
-    return AWAITING_INPUT
-
-async def handle_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_id = update.message.text
-    target_name = context.user_data.pop('target_name')
-    user_id = update.effective_user.id
-    
-    msg = await update.message.reply_text(f"Verifying permissions for `{target_id}`...")
-    try:
-        if target_id.lower() != 'me':
-            # Verification logic for group/channel
-            chat = await context.bot.get_chat(target_id)
-            if chat.type == ChatType.SUPERGROUP and getattr(chat, 'is_forum', False):
-                # Test topic creation
-                test_topic = await context.bot.create_forum_topic(chat_id=target_id, name="-- Bot Permission Check --")
-                await context.bot.delete_forum_topic(chat_id=target_id, message_thread_id=test_topic.message_thread_id)
-            else:
-                # Test send/delete message
-                sent_msg = await context.bot.send_message(chat_id=target_id, text="-- Bot Permission Check --")
-                await context.bot.delete_message(chat_id=target_id, message_id=sent_msg.message_id)
-        
-        await db.add_target(user_id, target_name, target_id)
-        await msg.edit_text(f"✅ Target '{target_name}' added successfully!")
-    except Exception as e:
-        await msg.edit_text(f"❌ Failed to verify target. I might be missing permissions.\n<b>Error:</b> {e}", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
-
-    # After adding, show the updated menu
-    await update.message.reply_text("Returning to settings...")
-    # This is a bit clunky, a better UI would be to re-render the settings message
-    # For now, let's prompt the user to restart
-    await start_command(update, context) # Restart the main menu
-    return ConversationHandler.END
-
-
-# ... (and many more callback handlers for worker management, login, etc.)
-# The full code is too long, but this shows the new modular and UI-driven structure.
-# The following is the rest of the code, completed.
-
-# =============================================================================
-# 3. WORKER MANAGEMENT
-# =============================================================================
-async def workers_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    workers = await db.get_worker_bots(user_id)
-    
-    keyboard = [[InlineKeyboardButton(f"🗑️ @{w['username']}", callback_data=f"delete_worker_{w['id']}")] for w in workers]
-    keyboard.append([InlineKeyboardButton("➕ Add New Worker", callback_data="add_worker")])
-    keyboard.append([InlineKeyboardButton("« Back", callback_data="start_over")])
-    
-    await query.edit_message_text(
-        f"<b>🤖 Worker Management ({len(workers)} active)</b>\n\nAdd or remove worker bots for deep scraping.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.HTML
-    )
-    return SELECTING_ACTION
-
-async def add_worker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ud = await db.get_user_data(query.from_user.id)
     if not ud or 'session_string' not in ud:
-        await query.answer("You must be logged in to add workers.", show_alert=True)
-        return SELECTING_ACTION
-        
-    await query.edit_message_text("Please send me the bot token(s) for the new worker(s), separated by a space.")
-    return AWAITING_INPUT
-
-async def handle_worker_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ud = await db.get_user_data(user_id)
-    tokens = update.message.text.split()
-    
-    targets = await db.get_targets(user_id)
-    if not targets:
-        await update.message.reply_text("You must add at least one target group before adding workers. Use /start to manage targets.")
-        return ConversationHandler.END
-
-    # For simplicity, we'll use the first target for promotion. A better UI could ask.
-    target_group_id = int(targets[0]['id'])
+        return await update.message.reply_html("You must `/login` first.")
+    if not ud.get('target_group_id'):
+        return await update.message.reply_html("You must `/setgroup` first.")
+    if not context.args:
+        return await update.message.reply_html("<b>Usage:</b> `/addworkers [bot_token]...`")
 
     msg = await update.message.reply_html("Processing worker tokens...")
     added_workers, failed_workers = [], []
+    target_group_id = int(ud['target_group_id'])
+    
+    # Minimal, valid admin rights for a worker bot.
     admin_rights = ChatAdminRights(delete_messages=True)
 
-    async with get_userbot_client(ud['session_string']) as client:
+    async with await get_userbot_client(ud['session_string']) as client:
+        # Fetch current admins once to avoid repeated calls
         try:
-            current_admins = {p.id for p in await client.get_participants(target_group_id, filter=None) if p.participant}
+            current_admins = {admin.id async for admin in client.iter_participants(target_group_id, filter=None) if admin.participant}
         except Exception as e:
-            await msg.edit_text(f"Could not fetch admins. Error: {e}"); return ConversationHandler.END
+            return await msg.edit_text(f"Could not fetch admins from target group. Error: {e}")
 
-        for token in tokens:
+        for token in context.args:
             try:
                 worker_bot = ExtBot(token=token)
                 worker_info = await worker_bot.get_me()
-
+                
+                # Add to global pool if not already there
                 if token not in WORKER_BOT_POOL:
                     WORKER_BOT_POOL[token] = worker_bot
-                    logger.info(f"Dynamically initialized worker {worker_info.id}")
+                    logger.info(f"Dynamically added and initialized worker {worker_info.id}")
 
+                await msg.edit_text(f"Processing @{worker_info.username}...")
+                
                 worker_entity = await client.get_input_entity(worker_info.username)
                 
-                if worker_info.id not in current_admins:
+                # Check if the bot is already an admin
+                if worker_info.id in current_admins:
+                    logger.info(f"Bot @{worker_info.username} is already an admin. Skipping invite/promote.")
+                else:
                     try:
                         await client(functions.channels.InviteToChannelRequest(target_group_id, [worker_entity]))
-                    except UserAlreadyParticipantError: pass
+                    except UserAlreadyParticipantError:
+                        pass # Already in group, but not admin
+                    
                     await client(functions.channels.EditAdminRequest(target_group_id, worker_entity, admin_rights, "Worker Bot"))
                 
                 worker_data = {"id": worker_info.id, "username": worker_info.username, "token": token}
                 await db.add_worker_bots(user_id, [worker_data])
-                added_workers.append(f"• @{worker_info.username}")
+                added_workers.append(f"• @{worker_info.username} (<code>{worker_info.id}</code>)")
             except Exception as e:
-                failed_workers.append(f"• Token `{token[:8]}...` ({e})")
+                failed_workers.append(f"• <code>{token[:8]}...</code> ({e})")
+
+    response_text = "✅ <b>Worker setup complete!</b>\n\n"
+    if added_workers:
+        response_text += "<b>Added to Pool:</b>\n" + "\n".join(added_workers) + "\n\n"
+    if failed_workers:
+        response_text += "<b>Failed:</b>\n" + "\n".join(failed_workers)
     
-    response = "✅ <b>Worker setup complete!</b>\n"
-    if added_workers: response += "\n<b>Added to Pool:</b>\n" + "\n".join(added_workers)
-    if failed_workers: response += "\n\n<b>Failed:</b>\n" + "\n".join(failed_workers)
-    await msg.edit_text(response, parse_mode=ParseMode.HTML)
-    
-    await start_command(update, context)
+    await msg.edit_text(response_text, parse_mode=ParseMode.HTML)
+
+
+async def listworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    workers = await db.get_worker_bots(update.effective_user.id)
+    if not workers:
+        return await update.message.reply_html("You have no worker bots configured.")
+    worker_list = [f"• @{w['username']} (<code>{w['id']}</code>)" for w in workers]
+    await update.message.reply_html("<b>Your configured worker bots:</b>\n" + "\n".join(worker_list))
+
+async def removeworkers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_html("<b>Usage:</b> `/removeworkers [bot_id]...`")
+    try:
+        worker_ids = [int(arg) for arg in context.args]
+        await db.remove_worker_bots(update.effective_user.id, worker_ids)
+        await update.message.reply_html(f"✅ Removed bots with IDs: <code>{', '.join(context.args)}</code>.")
+    except ValueError:
+        await update.message.reply_html("Invalid bot ID. Please provide numeric IDs only.")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await start_command(update, context)
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = await db.get_user_active_task(update.effective_user.id)
+    if task: await db.update_task_status(task['_id'], "stopped")
+    context.user_data['is_scraping'] = False; context.user_data.pop('state', None)
+    await update.message.reply_html("<b>All tasks stopped.</b>")
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE): await stop_command(update, context)
+async def mydata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = await db.get_user_data(update.effective_user.id)
+    target_chat = (ud or {}).get('target_chat_id', 'Not Set'); target_group = (ud or {}).get('target_group_id', 'Not Set')
+    session_set = "Yes" if (ud or {}).get('session_string') else "No"
+    worker_count = len((ud or {}).get('worker_bots', []))
+    message = (f"<b>Your Settings:</b>\n\n"
+               f"👤 <b>Logged In:</b> {session_set}\n"
+               f"🎯 <b>Single Scrape Target:</b> <code>{target_chat}</code>\n"
+               f"🗂️ <b>Deep Scrape Target:</b> <code>{target_group}</code>\n"
+               f"🤖 <b>Worker Bots:</b> {worker_count}")
+    await update.message.reply_html(message)
+async def settarget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/settarget [chat_id | me]</code>")
+    target_id = context.args[0]
+    if target_id.lower() != 'me':
+        try:
+            msg = await context.bot.send_message(chat_id=target_id, text="-- Permission Check --")
+            await context.bot.delete_message(chat_id=target_id, message_id=msg.message_id)
+        except Exception as e:
+            return await update.message.reply_html(f"<b>Permission Denied!</b>\n<b>Error:</b> <code>{e}</code>")
+    await db.save_user_data(update.effective_user.id, {'target_chat_id': target_id})
+    await update.message.reply_html(f"✅ Single scrape target set.")
+async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/setgroup [supergroup_id]</code>")
+    group_id = context.args[0]
+    try:
+        chat_admins = await context.bot.get_chat_administrators(chat_id=group_id)
+        if not any(admin.user.id == context.bot.id for admin in chat_admins):
+            return await update.message.reply_html(f"<b>Permission Denied!</b> I'm not an admin.")
+    except Exception as e:
+        return await update.message.reply_html(f"<b>Error:</b> <code>{e}</code>")
+    await db.save_user_data(update.effective_user.id, {'target_group_id': group_id})
+    await update.message.reply_html(f"✅ Deep scrape target group set.")
+
+# --- CORE LOGIC HANDLERS ---
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Please send your Telethon session string.")
+    return 'awaiting_session'
+async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
+    try:
+        async with await get_userbot_client(session_string) as client:
+            if not client or not await client.is_user_authorized(): return await update.message.reply_text("❌ Login failed.")
+            me = await client.get_me()
+            await db.save_user_data(update.effective_user.id, {'session_string': session_string})
+            await update.message.reply_html(f"✅ Logged in as <b>{me.first_name}</b>!")
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"An error occurred: {e}"); return ConversationHandler.END
+
+async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = find_url_in_text(update.message.text) or (context.args[0] if context.args else None)
+    if not url: await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code>"); return ConversationHandler.END
+    context.user_data['is_scraping'] = True
+    msg = await update.message.reply_html(f"🔎 Scraping <code>{preprocess_url(url)}</code>...")
+    images = await asyncio.to_thread(scrape_images_from_url_sync, preprocess_url(url), context.user_data)
+    if not context.user_data.get('is_scraping', False): return ConversationHandler.END
+    if not images: await msg.edit_text("Could not find any images on that page."); return ConversationHandler.END
+    context.user_data['scraped_images'] = list(images)
+    file_types = Counter(get_file_extension(img) for img in images)
+    keyboard = [[InlineKeyboardButton(f"{(ext or 'Other').upper()} ({count})", callback_data=f"scrape_{ext or 'none'}")] for ext, count in file_types.items()]
+    keyboard.append([InlineKeyboardButton(f"All Files ({len(images)})", callback_data="scrape_all")])
+    await msg.edit_text("✅ <b>Scan complete!</b> Choose file type:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return 'awaiting_file_type'
+async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chosen_ext = query.data.split('_', 1)[1]
+    all_images = context.user_data.get('scraped_images', [])
+    if chosen_ext == 'all': images_to_send = all_images
+    elif chosen_ext == 'none': images_to_send = [img for img in all_images if not get_file_extension(img)]
+    else: images_to_send = [img for img in all_images if get_file_extension(img) == chosen_ext]
+    user_db_data = await db.get_user_data(update.effective_user.id)
+    target_chat_id = (user_db_data or {}).get('target_chat_id', str(update.effective_chat.id))
+    if target_chat_id == 'me': target_chat_id = str(update.effective_chat.id)
+    await query.edit_message_text(f"Sending {len(images_to_send)} images to <code>{target_chat_id}</code>...", parse_mode=ParseMode.HTML)
+    context.user_data['is_scraping'] = True
+    for img in images_to_send:
+        if not context.user_data.get('is_scraping'): break
+        try: await context.bot.send_photo(target_chat_id, photo=img)
+        except Exception as e: logger.warning(f"Failed to send photo {img} to {target_chat_id}: {e}")
+    context.user_data['is_scraping'] = False
+    await query.message.reply_html("✅ <b>Sending complete!</b>")
     return ConversationHandler.END
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    task = await db.get_user_active_task(update.effective_user.id)
+    if not task:
+        await query.edit_message_text("No active deepscrape task found, or it has completed.")
+        return
+    message = (f"📊 <b>Task Status:</b> {task['status'].title()}\n"
+               f"🔗 <b>Progress:</b> Link {task['current_link_index'] + 1} of {task['total_links']}\n"
+               f"📄 <b>Current URL:</b> <code>...{task['current_link_url'][-50:]}</code>\n"
+               f"🖼️ <b>Images Found:</b> {task['current_link_images_found']}\n"
+               f"📤 <b>Images Uploaded:</b> {task['current_link_images_uploaded']}")
+    keyboard = [[InlineKeyboardButton("Refresh Status", callback_data="show_status")]]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+async def conv_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await stop_command(update, context); return ConversationHandler.END
+async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = await db.get_user_data(update.effective_user.id)
+    if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first.")
+    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/creategroup [Name]</code>")
+    group_name = " ".join(context.args)
+    msg = await update.message.reply_html(f"Creating supergroup '<b>{group_name}</b>'...")
+    try:
+        async with await get_userbot_client(ud['session_string']) as client:
+            created_chat = await client(functions.messages.CreateChatRequest(users=[(await context.bot.get_me()).username], title=group_name))
+            chat_id = created_chat.chats[0].id
+            await client(functions.channels.ConvertToGigagroupRequest(channel=chat_id))
+            full_channel = await client(functions.channels.GetFullChannelRequest(channel=chat_id))
+            supergroup_id = int(f"-100{full_channel.full_chat.id}")
+            await client.edit_admin(entity=supergroup_id, user=context.bot.id, is_admin=True, manage_topics=True)
+            await db.save_user_data(update.effective_user.id, {'target_group_id': str(supergroup_id)})
+            await msg.edit_text(f"✅ Supergroup created & set as target!\n<b>ID:</b> <code>{supergroup_id}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e: await msg.edit_text(f"An error occurred: {e}", parse_mode=ParseMode.HTML)
+async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    ud = await db.get_user_data(user_id)
+    if await db.get_user_active_task(user_id): return await update.message.reply_html("You already have an active deepscrape task.")
+    if not ud or not ud.get('target_group_id'): return await update.message.reply_html("❌ Target group not set. Use /setgroup.")
+    if not context.args: return await update.message.reply_html("<b>Usage:</b> <code>/deepscrape [url]</code>")
+    base_url = preprocess_url(context.args[0])
+    msg = await update.message.reply_html(f"Scanning <code>{base_url}</code> for links...")
+    try:
+        links_response = await asyncio.to_thread(requests.get, base_url, headers={'User-Agent': 'Mozilla/5.0'})
+        soup = BeautifulSoup(links_response.content, 'html.parser')
+        links = sorted(list({urljoin(base_url, a['href']) for a in soup.find_all('a', href=True) if urljoin(base_url, a.get('href', '')) != base_url and not (urljoin(base_url, a.get('href', ''))).endswith(('.zip', '.rar', '.exe', '.pdf'))}))
+        if not links: return await msg.edit_text("Found no unique, valid links.")
+        task_id = await db.create_task(user_id, base_url, links)
+        keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
+        await msg.edit_text(f"Found {len(links)} links. Starting deep scrape.", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.application.create_task(_run_deepscrape_task(user_id, task_id, context.application))
+    except Exception as e: await msg.edit_text(f"Failed to fetch links. Error: {e}")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    task = await db.get_user_active_task(update.effective_user.id)
+    if not task: return await update.message.reply_html("No active deepscrape task found.")
+    keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
+    await update.message.reply_html("You have an active deepscrape task.", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ... More handlers for deleting workers etc.
-
-# =============================================================================
-# 4. SCRAPE & DEEPSCRAPE WORKFLOWS
-# =============================================================================
-async def scrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = get_url_from_message(update.message)
-    if not url:
-        await update.message.reply_text("Please provide a URL to scrape. Reply or send `/scrape [url]`.")
-        return ConversationHandler.END
-    
-    context.user_data['url'] = url
-    context.user_data['scrape_type'] = 'single'
-    
-    targets = await db.get_targets(update.effective_user.id)
-    if not targets:
-        await update.message.reply_text("You have no targets set up. Please add one via /start -> Manage Targets.")
-        return ConversationHandler.END
-        
-    keyboard = [[InlineKeyboardButton(t['name'], callback_data=f"select_target_{t['id']}")] for t in targets]
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_scrape")])
-    await update.message.reply_text("Please choose a target for this scrape:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SCRAPE_SELECT_TARGET
-
-async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Similar to scrape_command_entry but sets 'scrape_type' to 'deep'
-    # and transitions to the same target selection state.
-    url = get_url_from_message(update.message)
-    if not url:
-        await update.message.reply_text("Please provide a URL to deep scrape. Reply or send `/deepscrape [url]`.")
-        return ConversationHandler.END
-    context.user_data['url'] = url
-    context.user_data['scrape_type'] = 'deep'
-    targets = await db.get_targets(update.effective_user.id)
-    if not targets:
-        await update.message.reply_text("You have no targets. Add one via /start -> Manage Targets.")
-        return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(t['name'], callback_data=f"select_target_{t['id']}")] for t in targets]
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_scrape")])
-    await update.message.reply_text("Choose a target for this deep scrape:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SCRAPE_SELECT_TARGET
-
-# ... (and many more callback handlers to manage the multi-step scrape setup)
-
-# =============================================================================
-# 5. THE REBUILT DEEPSCRAPE TASK RUNNER
-# =============================================================================
 async def _run_deepscrape_task(user_id, task_id, application: Application):
-    # This function is now much more robust, as outlined previously.
-    # It will use the task details from the DB (target, upload_as, range)
-    # and edit a single message for status updates.
-    pass # The logic is complex but follows the plan laid out in the incomplete response.
+    ud = await db.get_user_data(user_id)
+    target_group = ud.get('target_group_id')
+    if not target_group:
+        await application.bot.send_message(user_id, "<b>Error:</b> Target group not set."); return
 
+    worker_bots_data = await db.get_worker_bots(user_id)
+    # Use pre-initialized clients from the global pool
+    worker_clients = [WORKER_BOT_POOL[w['token']] for w in worker_bots_data if w['token'] in WORKER_BOT_POOL]
+    
+    if not worker_clients:
+        worker_clients.append(application.bot)
+        await application.bot.send_message(user_id, "⚠️ No worker bots found. Using main bot for uploads.")
 
-# --- MAIN SETUP ---
+    await db.update_task_status(task_id, "running")
+    await application.bot.send_message(user_id, f"🚀 <b>Deepscrape task started with {len(worker_clients)} uploader(s)!</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        while True:
+            task = await db.tasks_collection.find_one({"_id": task_id})
+            if not task or task['status'] != 'running': break
+            pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
+            if not pending_links:
+                await db.update_task_status(task_id, "completed"); await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b>"); break
+            link = pending_links[0]
+            current_link_num = len(task['completed_links']) + 1
+            await db.update_task_counters(task_id, current_link_num - 1, link, 0)
+            await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
+            images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
+            task = await db.tasks_collection.find_one({"_id": task_id})
+            if task.get('status') == 'stopped': break
+            if not images:
+                await db.complete_link_in_task(task_id, link); continue
+            await db.update_task_counters(task_id, current_link_num - 1, link, len(images))
+            try:
+                topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
+                created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title)
+                topic_id = created_topic.message_thread_id
+            except Exception as e:
+                await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}."); await db.update_task_status(task_id, "paused"); return
+            
+            image_queue = deque(images)
+            async def upload_worker(worker_bot: ExtBot):
+                while image_queue:
+                    try: img_url = image_queue.popleft()
+                    except IndexError: break
+                    try:
+                        await worker_bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
+                        await db.increment_task_image_upload_count(task_id)
+                    except RetryAfter as e:
+                        logger.warning(f"Worker {worker_bot.bot.id} hit flood wait. Re-queuing image.")
+                        image_queue.append(img_url); await asyncio.sleep(e.retry_after + 2)
+                    except Exception as e:
+                        logger.error(f"Worker {worker_bot.bot.id} failed to send {img_url}: {e}")
+            
+            upload_tasks = [upload_worker(bot) for bot in worker_clients]
+            await asyncio.gather(*upload_tasks)
+
+            task = await db.tasks_collection.find_one({"_id": task_id})
+            if task.get('status') == 'running':
+                await db.complete_link_in_task(task_id, link)
+                await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
+    
+    except Exception as e:
+        logger.error(f"Error in _run_deepscrape_task: {e}", exc_info=True)
+        await db.update_task_status(task_id, "paused")
+        await application.bot.send_message(user_id, f"An unexpected error occurred: <code>{e}</code>.", parse_mode=ParseMode.HTML)
+
+# --- Main Application Setup ---
 def main():
+    if not BOT_TOKEN: logger.critical("CRITICAL: BOT_TOKEN is MISSING."); sys.exit(1)
     persistence = PicklePersistence(filepath="./bot_persistence")
-    application = Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(post_init_callback).build()
+    application = (Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(post_init_callback).build())
 
-    # Define a master conversation handler for all UI interactions
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start_command),
-            CallbackQueryHandler(start_command, pattern="^start_over$"),
-            CallbackQueryHandler(targets_menu_callback, pattern="^targets_menu$"),
-            CallbackQueryHandler(workers_menu_callback, pattern="^workers_menu$"),
-            # ... all other entry points for settings
-            CommandHandler("scrape", scrape_command_entry),
-            CommandHandler("deepscrape", deepscrape_command_entry),
-        ],
-        states={
-            SELECTING_ACTION: [
-                CallbackQueryHandler(add_target_callback, pattern="^add_target$"),
-                CallbackQueryHandler(add_worker_callback, pattern="^add_worker$"),
-                # ... other action handlers
-            ],
-            AWAITING_INPUT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_target_name), # This state needs to be split
-                # A better approach uses different state numbers for different inputs
-            ],
-            SCRAPE_SELECT_TARGET: [
-                CallbackQueryHandler(scrape_select_target) # Example
-            ],
-            # ... other states
-        },
-        fallbacks=[CommandHandler("cancel", start_command)], # A generic cancel
-        persistent=True,
-        name="main_conv",
+    scrape_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("scrape", scrape_command)],
+        states={'awaiting_file_type': [CallbackQueryHandler(scrape_file_type_callback, pattern="^scrape_")]},
+        fallbacks=[CommandHandler("cancel", conv_fallback), CommandHandler("stop", conv_fallback)],
+        persistent=True, name="scrape_conv", conversation_timeout=600
     )
-    
-    # Due to extreme complexity, a full implementation is not feasible here.
-    # This structure provides the blueprint for the final bot.
-    # The actual implementation would require careful state management and many more handlers.
-    
-    # Simplified handlers for demonstration
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("ping", ping_command))
-    application.add_handler(CallbackQueryHandler(ping_callback, pattern="^ping$"))
-    # Add the full conversation handler when ready
-    # application.add_handler(conv_handler)
-    
-    logger.info("Bot is starting...")
+    login_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("login", login_command)],
+        states={'awaiting_session': [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_session)]},
+        fallbacks=[CommandHandler("cancel", conv_fallback), CommandHandler("stop", conv_fallback)],
+        persistent=True, name="login_conv"
+    )
+
+    handlers = [
+        CommandHandler("start", start_command), CommandHandler("help", help_command),
+        CommandHandler("stop", stop_command), CommandHandler("cancel", cancel_command),
+        CommandHandler("mydata", mydata_command), CommandHandler("status", status_command),
+        CommandHandler("settarget", settarget_command), CommandHandler("setgroup", setgroup_command),
+        CommandHandler("creategroup", creategroup_command), CommandHandler("deepscrape", deepscrape_command),
+        CommandHandler("addworkers", addworkers_command),
+        CommandHandler("listworkers", listworkers_command),
+        CommandHandler("removeworkers", removeworkers_command),
+        login_conv_handler, scrape_conv_handler,
+        CallbackQueryHandler(status_callback, pattern="^show_status$"),
+    ]
+    application.add_handlers(handlers)
+    logger.info("All handlers registered. Starting bot polling...")
     application.run_polling()
 
 if __name__ == "__main__":
