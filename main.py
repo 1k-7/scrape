@@ -35,7 +35,7 @@ from handlers import (
     scrape_link_range_callback, scrape_all_links_callback, cancel_scrape_callback,
     work_command, select_work_target_callback,
     select_multiple_targets_callback, toggle_upload_option_callback,
-    confirm_upload_options_callback
+    confirm_upload_options_callback, refresh_progress_callback
 )
 
 # --- Basic Configuration ---
@@ -122,19 +122,17 @@ def main() -> None:
             
             SELECT_WORK_TARGET: [CallbackQueryHandler(select_work_target_callback, pattern=r"^work_target_")],
 
-            # Single Scrape Workflow
             SCRAPE_SELECT_TARGET: [CallbackQueryHandler(scrape_select_target_callback, pattern=r"^select_target_")],
             
-            # Deep Scrape Workflow
             SCRAPE_LINK_RANGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, scrape_link_range_callback),
                 CommandHandler("all", scrape_all_links_callback)
             ],
             SELECT_MULTIPLE_TARGETS: [CallbackQueryHandler(select_multiple_targets_callback, pattern=r"^multi_target_")],
             SCRAPE_UPLOAD_AS: [
-                CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_"), # For single scrape
-                CallbackQueryHandler(toggle_upload_option_callback, pattern=r"^toggle_"), # For deepscrape multi-select
-                CallbackQueryHandler(confirm_upload_options_callback, pattern="^confirm_upload_options") # For deepscrape multi-select
+                CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_"),
+                CallbackQueryHandler(toggle_upload_option_callback, pattern=r"^toggle_"),
+                CallbackQueryHandler(confirm_upload_options_callback, pattern="^confirm_upload_options")
             ],
         },
         fallbacks=[
@@ -147,6 +145,7 @@ def main() -> None:
     )
 
     application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(refresh_progress_callback, pattern="^refresh_progress$"))
     application.add_handler(CommandHandler("stop", stop_command))
 
     logger.info("Bot is starting polling...")
