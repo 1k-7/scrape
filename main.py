@@ -21,7 +21,8 @@ from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, PicklePersistence
+    ContextTypes, CallbackQueryHandler, PicklePersistence,
+    ConversationHandler  # --- THIS IS THE FIX ---
 )
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, BadRequest
@@ -81,33 +82,26 @@ def scrape_images_from_url_sync(url: str, user_data: dict):
     images = set()
     try:
         driver.get(url)
-        # Popup Handling
         popup_keywords = ['accept', 'agree', 'enter', 'continue', 'confirm', 'i am 18', 'yes', 'i agree']
         js_script = f"var keywords = {popup_keywords}; var buttons = document.querySelectorAll('button, a, div, span'); var clicked = false; for (var i = 0; i < buttons.length; i++) {{ var buttonText = buttons[i].innerText.toLowerCase(); for (var j = 0; j < keywords.length; j++) {{ if (buttonText.includes(keywords[j])) {{ buttons[i].click(); clicked = true; break; }} }} if (clicked) break; }} return clicked;"
         try:
             if driver.execute_script(js_script): logger.info(f"Clicked a popup on {url}."); time.sleep(3)
         except Exception as e: logger.warning(f"Popup click script failed: {e}")
         
-        # DOM-based Aggressive Scrolling
         last_height = driver.execute_script("return document.body.scrollHeight")
-        last_image_count = 0
-        stable_count = 0
-        while stable_count < 5: # Increased patience
+        last_image_count, stable_count = 0, 0
+        while stable_count < 5:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2.5)
             new_height = driver.execute_script("return document.body.scrollHeight")
             current_images = driver.find_elements(By.TAG_NAME, "img")
             current_image_count = len([img for img in current_images if img.get_attribute('src')])
-            
             if new_height == last_height and current_image_count == last_image_count:
                 stable_count += 1
             else:
                 stable_count = 0
-            
-            last_height = new_height
-            last_image_count = current_image_count
+            last_height = new_height; last_image_count = current_image_count
             if not user_data.get('is_scraping', True): break
-
         soup = BeautifulSoup(driver.page_source, "html.parser")
         for tag in soup.find_all("img"):
             src = tag.get("src") or tag.get("data-src")
@@ -125,6 +119,11 @@ def scrape_images_from_url_sync(url: str, user_data: dict):
     return {img for img in images if img and img.startswith('http')}
 
 # --- UTILITY & PERMISSION COMMANDS ---
+async def get_userbot_client(session_string: str):
+    if not session_string: return None
+    client = TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
+    await client.connect()
+    return client
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = (f"Hi <b>{user.mention_html()}</b>! I am the fully operational Image Scraper Bot.\n\n<b>Single Scraping:</b>\n• <code>/scrape [url]</code>\n• <code>/settarget [chat_id]</code>\n\n<b>Deep Scraping (User Account Required):</b>\n• <code>/login</code>\n• <code>/deepscrape [url]</code>\n• <code>/setgroup [chat_id]</code>\n• <code>/creategroup [name]</code>\n\n<b>General:</b>\n• <code>/status</code> - Check status of an active deepscrape.\n• <code>/mydata</code> - View your current settings.\n• <code>/stop</code> or <code>/cancel</code> - Stop any active task.")
@@ -172,38 +171,36 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- CORE LOGIC HANDLERS ---
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['state'] = 'awaiting_session'
-    await update.message.reply_text("Please send your Telethon session string now.\nOr use /cancel.")
+    return 'awaiting_session'
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('state') == 'awaiting_session':
-        session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
-        try:
-            async with await get_userbot_client(session_string) as client:
-                if not client or not await client.is_user_authorized(): return await update.message.reply_text("❌ Login failed. Invalid session string.")
-                me = await client.get_me()
-                await db.save_user_data(update.effective_user.id, {'session_string': session_string})
-                await update.message.reply_html(f"✅ Logged in as <b>{me.first_name}</b>!")
-            del context.user_data['state']
-        except Exception as e:
-            await update.message.reply_text(f"An error occurred: {e}"); context.user_data.pop('state', None)
+    session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
+    try:
+        async with await get_userbot_client(session_string) as client:
+            if not client or not await client.is_user_authorized(): return await update.message.reply_text("❌ Login failed. Invalid session string.")
+            me = await client.get_me()
+            await db.save_user_data(update.effective_user.id, {'session_string': session_string})
+            await update.message.reply_html(f"✅ Logged in as <b>{me.first_name}</b>!")
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"An error occurred: {e}"); return ConversationHandler.END
 async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = "";
     if context.args: url = preprocess_url(context.args[0])
     elif update.message.reply_to_message and update.message.reply_to_message.text: url = find_url_in_text(update.message.reply_to_message.text)
-    if not url: return await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code> or reply to a message.")
+    if not url: await update.message.reply_html("<b>Usage:</b> <code>/scrape [url]</code> or reply to a message."); return ConversationHandler.END
     context.user_data['is_scraping'] = True
     msg = await update.message.reply_html(f"🔎 Scraping <code>{url}</code>... This may take a moment.")
     images = await asyncio.to_thread(scrape_images_from_url_sync, url, context.user_data)
-    if not context.user_data.get('is_scraping', False): return
+    if not context.user_data.get('is_scraping', False): return ConversationHandler.END
     context.user_data['is_scraping'] = False
-    if not images: return await msg.edit_text("Could not find any images on that page.")
+    if not images: await msg.edit_text("Could not find any images on that page."); return ConversationHandler.END
     context.user_data['scraped_images'] = list(images); file_types = Counter(get_file_extension(img) for img in images)
     keyboard = []
     for ext, count in file_types.items(): keyboard.append([InlineKeyboardButton(f"{(ext or 'Other').upper()} ({count})", callback_data=f"scrape_{ext or 'none'}")])
     keyboard.append([InlineKeyboardButton(f"All Files ({len(images)})", callback_data="scrape_all")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await msg.edit_text("✅ <b>Scan complete!</b> Choose file type:", reply_markup=reply_markup)
-    context.user_data['state'] = 'awaiting_file_type'
+    return 'awaiting_file_type'
 async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -212,7 +209,6 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (f"📊 Task Status: {task['status'].title()}\n" f"🔗 Progress: Link {task['current_link_index'] + 1} of {task['total_links']}\n" f"📄 Current URL: ...{task['current_link_url'][-50:]}\n" f"🖼️ Images Found: {task['current_link_images_found']}\n" f"📤 Images Uploaded: {task['current_link_images_uploaded']}")
     await query.answer(message, show_alert=True)
 async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('state') != 'awaiting_file_type': return
     query = update.callback_query
     await query.answer()
     chosen_ext = query.data.split('_', 1)[1]
@@ -231,7 +227,10 @@ async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAUL
         except Exception as e: logger.warning(f"Failed to send photo {img} to {target_chat_id}: {e}")
     context.user_data['is_scraping'] = False
     await query.message.reply_html("✅ <b>Sending complete!</b>")
-    context.user_data.pop('state', None); context.user_data.pop('scraped_images', None)
+    return ConversationHandler.END
+async def conv_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await stop_command(update, context)
+    return ConversationHandler.END
 async def creategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = await db.get_user_data(update.effective_user.id)
     if not ud or 'session_string' not in ud: return await update.message.reply_html("You must /login first.")
@@ -288,7 +287,8 @@ async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_T
                 await db.update_task_counters(task_id, len(task['completed_links']), link, 0)
                 await context.bot.send_message(user_id, f"<b>Processing Link {len(task['completed_links'])+1}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
                 images = await asyncio.to_thread(scrape_images_from_url_sync, link, context.user_data)
-                if not task.get('is_scraping', True): break
+                task = await db.tasks_collection.find_one({"_id": task_id});
+                if task['status'] == 'stopped': break
                 if not images: await db.complete_link_in_task(task_id, link); continue
                 await db.update_task_counters(task_id, len(task['completed_links']), link, len(images))
                 topic_id = None
@@ -296,7 +296,7 @@ async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_T
                     task = await db.tasks_collection.find_one({"_id": task_id});
                     if task['status'] == 'stopped': break
                     try:
-                        topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98]
+                        topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
                         topic_result = await client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=context.bot._get_private_random_id()))
                         topic_id = topic_result.updates[0].message.id
                     except FloodWaitError as e:
@@ -325,36 +325,30 @@ def main():
     if not BOT_TOKEN: logger.critical("CRITICAL: BOT_TOKEN is MISSING."); sys.exit(1)
     persistence = PicklePersistence(filepath="./bot_persistence")
     application = (Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(post_init_callback).build())
-    # Separate handlers for clarity
+    
     scrape_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("scrape", scrape_command)],
-        states={
-            'awaiting_file_type': [CallbackQueryHandler(scrape_file_type_callback, pattern="^scrape_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        states={'awaiting_file_type': [CallbackQueryHandler(scrape_file_type_callback, pattern="^scrape_")]},
+        fallbacks=[CommandHandler("cancel", conv_fallback), CommandHandler("stop", conv_fallback)],
         persistent=True, name="scrape_conv", conversation_timeout=600
     )
     login_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("login", login_command)],
-        states={
-            'awaiting_session': [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        states={'awaiting_session': [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages)]},
+        fallbacks=[CommandHandler("cancel", conv_fallback), CommandHandler("stop", conv_fallback)],
         persistent=True, name="login_conv"
     )
-    # Register all handlers
-    application.add_handler(CommandHandler("start", start_command)); application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stop", stop_command)); application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("mydata", mydata_command)); application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("settarget", settarget_command)); application.add_handler(CommandHandler("setgroup", setgroup_command))
-    application.add_handler(CommandHandler("creategroup", creategroup_command)); application.add_handler(CommandHandler("deepscrape", deepscrape_command))
-    # Add conversation handlers
-    application.add_handler(scrape_conv_handler); application.add_handler(login_conv_handler)
-    # Add the global status button handler
-    application.add_handler(CallbackQueryHandler(status_callback, pattern="^show_status$"))
-    # Add the generic text handler at the end
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
-    
+
+    handlers = [
+        CommandHandler("start", start_command), CommandHandler("help", help_command),
+        CommandHandler("stop", stop_command), CommandHandler("cancel", cancel_command),
+        CommandHandler("mydata", mydata_command), CommandHandler("status", status_command),
+        CommandHandler("settarget", settarget_command), CommandHandler("setgroup", setgroup_command),
+        CommandHandler("creategroup", creategroup_command), CommandHandler("deepscrape", deepscrape_command),
+        login_conv_handler, scrape_conv_handler,
+        CallbackQueryHandler(status_callback, pattern="^show_status$"),
+    ]
+    application.add_handlers(handlers)
     logger.info("All handlers registered. Starting bot polling...")
     application.run_polling()
 
