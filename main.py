@@ -21,8 +21,7 @@ from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler, PicklePersistence,
-    ConversationHandler  # --- THIS IS THE FIX ---
+    ContextTypes, CallbackQueryHandler, PicklePersistence, ConversationHandler
 )
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, BadRequest
@@ -172,7 +171,7 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- CORE LOGIC HANDLERS ---
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return 'awaiting_session'
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
     try:
         async with await get_userbot_client(session_string) as client:
@@ -260,20 +259,20 @@ async def deepscrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         task_id = await db.create_task(update.effective_user.id, base_url, links)
         keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
         await msg.edit_text(f"Found {len(links)} links. Starting deep scrape in the background.\nTo cancel, use /stop.", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.application.create_task(_run_deepscrape_task(update.effective_user.id, task_id, context))
+        context.application.create_task(_run_deepscrape_task(update.effective_user.id, task_id, context.application))
     except Exception as e: await msg.edit_text(f"Failed to fetch links from URL. Error: {e}")
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await db.get_user_active_task(update.effective_user.id)
     if not task: return await update.message.reply_html("No active deepscrape task found.")
     keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
     await update.message.reply_html("You have an active deepscrape task.", reply_markup=InlineKeyboardMarkup(keyboard))
-async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_TYPE):
+async def _run_deepscrape_task(user_id, task_id, application: Application):
+    context = ContextTypes(application=application)
     ud = await db.get_user_data(user_id)
     if not ud or 'session_string' not in ud: return
     target_group = ud.get('target_group_id')
     if not target_group: await context.bot.send_message(user_id, "<b>Error:</b> Deepscrape target group not set."); return
     await db.update_task_status(task_id, "running")
-    context.user_data['is_scraping'] = True
     try:
         async with await get_userbot_client(ud['session_string']) as client:
             entity = await client.get_entity(int(target_group))
@@ -286,7 +285,7 @@ async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_T
                 link = pending_links[0]
                 await db.update_task_counters(task_id, len(task['completed_links']), link, 0)
                 await context.bot.send_message(user_id, f"<b>Processing Link {len(task['completed_links'])+1}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
-                images = await asyncio.to_thread(scrape_images_from_url_sync, link, context.user_data)
+                images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
                 task = await db.tasks_collection.find_one({"_id": task_id});
                 if task['status'] == 'stopped': break
                 if not images: await db.complete_link_in_task(task_id, link); continue
@@ -297,12 +296,13 @@ async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_T
                     if task['status'] == 'stopped': break
                     try:
                         topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
-                        topic_result = await client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=context.bot._get_private_random_id()))
+                        topic_result = await client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=application.bot._get_private_random_id()))
                         topic_id = topic_result.updates[0].message.id
                     except FloodWaitError as e:
                         await db.update_task_status(task_id, "paused"); await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Flood wait. Resuming in {e.seconds + 5}s.", parse_mode=ParseMode.HTML)
                         await asyncio.sleep(e.seconds + 5); await db.update_task_status(task_id, "running")
                 if not topic_id: continue
+                await context.bot.send_message(user_id, f"Found {len(images)} images for link {len(task['completed_links'])+1}. Starting upload...")
                 for img_url in images:
                     while True:
                         task = await db.tasks_collection.find_one({"_id": task_id});
@@ -314,11 +314,9 @@ async def _run_deepscrape_task(user_id, task_id, context: ContextTypes.DEFAULT_T
                             await db.update_task_status(task_id, "paused"); await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
                             await asyncio.sleep(e.retry_after + 5); await db.update_task_status(task_id, "running")
                     if task['status'] == 'stopped': break
-                if task['status'] == 'running': await db.complete_link_in_task(task_id, link)
+                if task['status'] == 'running': await db.complete_link_in_task(task_id, link); await context.bot.send_message(user_id, f"Finished uploading for link {len(task['completed_links'])+1}.")
     except Exception as e:
         logger.error(f"Error in _run_deepscrape_task: {e}"); await db.update_task_status(task_id, "paused")
-    finally:
-        context.user_data['is_scraping'] = False
 
 # --- Main Application Setup ---
 def main():
@@ -334,7 +332,7 @@ def main():
     )
     login_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("login", login_command)],
-        states={'awaiting_session': [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages)]},
+        states={'awaiting_session': [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_session)]},
         fallbacks=[CommandHandler("cancel", conv_fallback), CommandHandler("stop", conv_fallback)],
         persistent=True, name="login_conv"
     )
