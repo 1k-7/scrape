@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from telethon import functions
-from telethon.errors import UserAlreadyParticipantError, UserAdminInvalidError
+from telethon.errors import UserAlreadyParticipantError
 from telethon.tl.types import ChatAdminRights
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -25,11 +25,11 @@ from deepscrape_task import run_deepscrape_task
 
 logger = logging.getLogger(__name__)
 
-# States
+# States - CORRECTED AND COMPLETE
 (SELECTING_ACTION, AWAITING_TARGET_NAME, AWAITING_TARGET_ID,
  AWAITING_WORKER_TOKEN, AWAITING_LOGIN_SESSION,
  SCRAPE_SELECT_TARGET, SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE,
- CONFIRM_TARGET_DELETE, CONFIRM_WORKER_DELETE) = range(10)
+ CONFIRM_TARGET_DELETE, CONFIRM_WORKER_DELETE, AWAITING_WORKER_TARGET) = range(11)
 
 
 # =============================================================================
@@ -357,7 +357,7 @@ async def scrape_upload_as_callback(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
 
 async def scrape_link_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['link_range'] = update.message.text.strip()
+    context.user_data['link_range'] = update.message.text.strip().lower()
     await update.message.reply_text("Starting deep scrape...")
     await start_deep_scrape(update, context)
     return ConversationHandler.END
@@ -382,14 +382,17 @@ async def start_single_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.edit_message_text(f"Found {len(images)} images. Starting upload to `{target_id}` as {upload_as}s...")
     
-    upload_func = context.bot.send_photo if upload_as == 'photo' else context.bot.send_document
     for img_url in images:
         try:
-            await upload_func(chat_id=target_id, photo=img_url if upload_as == 'photo' else None, document=img_url if upload_as == 'document' else None)
+            if upload_as == 'photo':
+                await context.bot.send_photo(chat_id=target_id, photo=img_url)
+            else:
+                await context.bot.send_document(chat_id=target_id, document=img_url)
         except Exception as e:
             logger.warning(f"Failed to send {img_url} to {target_id}: {e}")
 
     await query.message.reply_text("✅ Single scrape and upload complete!")
+    context.user_data.clear()
 
 async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = context.user_data
@@ -406,7 +409,7 @@ async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         task_id = await db.create_task(update.effective_user.id, url, links, target_id, upload_as, link_range, msg.message_id)
         await msg.edit_text(f"Found {len(links)} links. Deep scrape has started in the background. Use /stop to cancel.")
-        context.application.create_task(run_deepscrape_task(update.effective_user.id, task_id, context.application, WORKER_BOT_POOL))
+        context.application.create_task(run_deepscrape_task(update.effective_user.id, task_id, context.application, context.application.bot_data["WORKER_BOT_POOL"]))
 
     except Exception as e:
         await msg.edit_text(f"Failed to fetch links from URL. Error: {e}")
