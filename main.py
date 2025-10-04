@@ -86,7 +86,7 @@ def scrape_images_from_url_sync(url: str, user_data: dict):
         try:
             if driver.execute_script(js_script): logger.info(f"Clicked a popup on {url}."); time.sleep(3)
         except Exception as e: logger.warning(f"Popup click script failed: {e}")
-        
+
         last_height = driver.execute_script("return document.body.scrollHeight")
         last_image_count, stable_count = 0, 0
         while stable_count < 5:
@@ -170,7 +170,9 @@ async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- CORE LOGIC HANDLERS ---
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Please send your Telethon session string.")
     return 'awaiting_session'
+
 async def handle_login_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_string = update.message.text.strip(); await update.message.reply_text("Validating session...")
     try:
@@ -204,9 +206,20 @@ async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     task = await db.get_user_active_task(update.effective_user.id)
-    if not task: return await query.answer("No active deepscrape task found, or it has completed.", show_alert=True)
-    message = (f"📊 Task Status: {task['status'].title()}\n" f"🔗 Progress: Link {task['current_link_index'] + 1} of {task['total_links']}\n" f"📄 Current URL: ...{task['current_link_url'][-50:]}\n" f"🖼️ Images Found: {task['current_link_images_found']}\n" f"📤 Images Uploaded: {task['current_link_images_uploaded']}")
-    await query.answer(message, show_alert=True)
+    if not task:
+        await query.edit_message_text("No active deepscrape task found, or it has completed.")
+        return
+
+    message = (
+        f"📊 <b>Task Status:</b> {task['status'].title()}\n"
+        f"🔗 <b>Progress:</b> Link {task['current_link_index'] + 1} of {task['total_links']}\n"
+        f"📄 <b>Current URL:</b> <code>...{task['current_link_url'][-50:]}</code>\n"
+        f"🖼️ <b>Images Found:</b> {task['current_link_images_found']}\n"
+        f"📤 <b>Images Uploaded:</b> {task['current_link_images_uploaded']}"
+    )
+    keyboard = [[InlineKeyboardButton("Refresh Status", callback_data="show_status")]]
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
 async def scrape_file_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -267,63 +280,109 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("Show Status", callback_data="show_status")]]
     await update.message.reply_html("You have an active deepscrape task.", reply_markup=InlineKeyboardMarkup(keyboard))
 async def _run_deepscrape_task(user_id, task_id, application: Application):
-    context = ContextTypes(application=application)
     ud = await db.get_user_data(user_id)
-    if not ud or 'session_string' not in ud: return
+    if not ud or 'session_string' not in ud:
+        await application.bot.send_message(user_id, "<b>Error:</b> You are not logged in. Stopping task.", parse_mode=ParseMode.HTML)
+        return
+
     target_group = ud.get('target_group_id')
-    if not target_group: await context.bot.send_message(user_id, "<b>Error:</b> Deepscrape target group not set."); return
+    if not target_group:
+        await application.bot.send_message(user_id, "<b>Error:</b> Deepscrape target group not set. Stopping task.", parse_mode=ParseMode.HTML)
+        return
+
     await db.update_task_status(task_id, "running")
+    await application.bot.send_message(user_id, "🚀 <b>Deepscrape task started!</b>", parse_mode=ParseMode.HTML)
     try:
         async with await get_userbot_client(ud['session_string']) as client:
             entity = await client.get_entity(int(target_group))
             while True:
                 task = await db.tasks_collection.find_one({"_id": task_id})
-                if task['status'] != 'running': break
+                if not task or task['status'] != 'running':
+                    if task and task.get('status') == 'stopped':
+                        await application.bot.send_message(user_id, "🛑 <b>Deepscrape task has been stopped by user.</b>", parse_mode=ParseMode.HTML)
+                    break
+
                 pending_links = [link for link in task['all_links'] if link not in task['completed_links']]
                 if not pending_links:
-                    await db.update_task_status(task_id, "completed"); await context.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b>", parse_mode=ParseMode.HTML); break
+                    await db.update_task_status(task_id, "completed")
+                    await application.bot.send_message(user_id, "✅ <b>Deep scrape finished!</b> All links processed.", parse_mode=ParseMode.HTML)
+                    break
+
                 link = pending_links[0]
-                await db.update_task_counters(task_id, len(task['completed_links']), link, 0)
-                await context.bot.send_message(user_id, f"<b>Processing Link {len(task['completed_links'])+1}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
+                current_link_num = len(task['completed_links']) + 1
+                await db.update_task_counters(task_id, current_link_num - 1, link, 0)
+                await application.bot.send_message(user_id, f"<b>Processing Link {current_link_num}/{task['total_links']}:</b>\n<code>{link}</code>", parse_mode=ParseMode.HTML)
+
                 images = await asyncio.to_thread(scrape_images_from_url_sync, link, {"is_scraping": True})
-                task = await db.tasks_collection.find_one({"_id": task_id});
+                task = await db.tasks_collection.find_one({"_id": task_id}) # Re-fetch task state
                 if task['status'] == 'stopped': break
-                if not images: await db.complete_link_in_task(task_id, link); continue
-                await db.update_task_counters(task_id, len(task['completed_links']), link, len(images))
+
+                if not images:
+                    await db.complete_link_in_task(task_id, link)
+                    await application.bot.send_message(user_id, f"Link {current_link_num} had no images. Moving to next.", parse_mode=ParseMode.HTML)
+                    continue
+
+                await db.update_task_counters(task_id, current_link_num - 1, link, len(images))
+
                 topic_id = None
                 while not topic_id:
-                    task = await db.tasks_collection.find_one({"_id": task_id});
+                    task = await db.tasks_collection.find_one({"_id": task_id})
                     if task['status'] == 'stopped': break
                     try:
                         topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
                         topic_result = await client(functions.channels.CreateForumTopicRequest(channel=entity, title=topic_title, random_id=application.bot._get_private_random_id()))
                         topic_id = topic_result.updates[0].message.id
+                        await application.bot.send_message(user_id, f"Created topic '<b>{topic_title}</b>' for link {current_link_num}.", parse_mode=ParseMode.HTML)
                     except FloodWaitError as e:
-                        await db.update_task_status(task_id, "paused"); await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Flood wait. Resuming in {e.seconds + 5}s.", parse_mode=ParseMode.HTML)
-                        await asyncio.sleep(e.seconds + 5); await db.update_task_status(task_id, "running")
+                        await db.update_task_status(task_id, "paused")
+                        await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Flood wait. Resuming in {e.seconds + 5}s.", parse_mode=ParseMode.HTML)
+                        await asyncio.sleep(e.seconds + 5)
+                        await db.update_task_status(task_id, "running")
+                    except Exception as e:
+                        await application.bot.send_message(user_id, f"<b>Error creating topic:</b> {e}. Stopping task.", parse_mode=ParseMode.HTML)
+                        await db.update_task_status(task_id, "paused")
+                        return
+
                 if not topic_id: continue
-                await context.bot.send_message(user_id, f"Found {len(images)} images for link {len(task['completed_links'])+1}. Starting upload...")
+
+                await application.bot.send_message(user_id, f"Found {len(images)} images for link {current_link_num}. Starting upload...")
                 for img_url in images:
                     while True:
-                        task = await db.tasks_collection.find_one({"_id": task_id});
+                        task = await db.tasks_collection.find_one({"_id": task_id})
                         if task['status'] == 'stopped': break
                         try:
-                            await context.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
-                            await db.increment_task_image_upload_count(task_id); break
+                            await application.bot.send_photo(target_group, photo=img_url, message_thread_id=topic_id)
+                            await db.increment_task_image_upload_count(task_id)
+                            break
                         except RetryAfter as e:
-                            await db.update_task_status(task_id, "paused"); await context.bot.send_message(user_id, f"<b>Auto-Pause:</b> Limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
-                            await asyncio.sleep(e.retry_after + 5); await db.update_task_status(task_id, "running")
+                            await db.update_task_status(task_id, "paused")
+                            await application.bot.send_message(user_id, f"<b>Auto-Pause:</b> Limit reached. Resuming in {e.retry_after + 5}s.", parse_mode=ParseMode.HTML)
+                            await asyncio.sleep(e.retry_after + 5)
+                            await db.update_task_status(task_id, "running")
+                        except Exception as e:
+                            logger.warning(f"Failed to send photo {img_url}: {e}")
+                            break # Skip this image on failure
                     if task['status'] == 'stopped': break
-                if task['status'] == 'running': await db.complete_link_in_task(task_id, link); await context.bot.send_message(user_id, f"Finished uploading for link {len(task['completed_links'])+1}.")
+
+                if task['status'] == 'running':
+                    await db.complete_link_in_task(task_id, link)
+                    await application.bot.send_message(user_id, f"Finished uploading for link {current_link_num}.")
+
     except Exception as e:
-        logger.error(f"Error in _run_deepscrape_task: {e}"); await db.update_task_status(task_id, "paused")
+        logger.error(f"Error in _run_deepscrape_task: {e}", exc_info=True)
+        await db.update_task_status(task_id, "paused")
+        try:
+            await application.bot.send_message(user_id, f"An unexpected error occurred in the deepscrape task: <code>{e}</code>. The task has been paused.", parse_mode=ParseMode.HTML)
+        except Exception as send_e:
+            logger.error(f"Failed to send error message to user: {send_e}")
+
 
 # --- Main Application Setup ---
 def main():
     if not BOT_TOKEN: logger.critical("CRITICAL: BOT_TOKEN is MISSING."); sys.exit(1)
     persistence = PicklePersistence(filepath="./bot_persistence")
     application = (Application.builder().token(BOT_TOKEN).persistence(persistence).post_init(post_init_callback).build())
-    
+
     scrape_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("scrape", scrape_command)],
         states={'awaiting_file_type': [CallbackQueryHandler(scrape_file_type_callback, pattern="^scrape_")]},
