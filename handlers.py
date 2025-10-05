@@ -439,6 +439,51 @@ async def select_work_target_callback(update: Update, context: ContextTypes.DEFA
 # =============================================================================
 # 6. SCRAPE & DEEPSCRAPE WORKFLOWS
 # =============================================================================
+async def scrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = get_url_from_message(update.message)
+    if not url:
+        await update.message.reply_text("Please provide a URL to scrape. Reply or send `/scrape [url]`.")
+        return ConversationHandler.END
+    
+    context.user_data['url'] = url
+    
+    targets = await db.get_targets(update.effective_user.id)
+    if not targets:
+        await update.message.reply_text(
+            "You have no targets. Please add one via the settings menu.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Open Settings", callback_data="main_menu")]])
+        )
+        return ConversationHandler.END
+        
+    keyboard = [[InlineKeyboardButton(t['name'], callback_data=f"select_target_{t['id']}")] for t in targets]
+    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel_scrape")])
+    await update.message.reply_text("Please choose a target for this scrape:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    return SCRAPE_SELECT_TARGET
+
+async def scrape_select_target_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['target_id'] = query.data.split('_', 2)[2]
+    
+    keyboard = [
+        [InlineKeyboardButton("🖼️ As Photos", callback_data="upload_as_photo")],
+        [InlineKeyboardButton("📄 As Documents", callback_data="upload_as_document")],
+        [InlineKeyboardButton("Cancel", callback_data="cancel_scrape")]
+    ]
+    await query.edit_message_text("How should the images be uploaded?", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    return SCRAPE_UPLOAD_AS
+
+async def scrape_upload_as_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['upload_as'] = query.data.split('_', 2)[2]
+    
+    await query.edit_message_text("Starting single scrape...")
+    await start_single_scrape(update, context)
+    return ConversationHandler.END
+
 async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = get_url_from_message(update.message)
     if not url:
@@ -471,6 +516,14 @@ async def deepscrape_command_entry(update: Update, context: ContextTypes.DEFAULT
         await msg.edit_text(f"Failed to fetch links. Error: {e}")
         return ConversationHandler.END
 
+async def scrape_link_range_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['link_range'] = update.message.text.strip().lower()
+    return await prompt_for_targets(update.message, context)
+
+async def scrape_all_links_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['link_range'] = 'all'
+    return await prompt_for_targets(update.message, context)
+
 async def prompt_for_targets(message: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     all_links = context.user_data['all_links']
     link_range = context.user_data['link_range']
@@ -499,6 +552,45 @@ async def prompt_for_targets(message: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return SELECT_MULTIPLE_TARGETS
 
+async def select_multiple_targets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    
+    target_id = query.data.split('_', 2)[-1]
+    if target_id == 'pm':
+        target_id = str(query.from_user.id)
+
+    selected_targets = context.user_data['selected_targets']
+    if target_id not in selected_targets:
+        selected_targets.append(target_id)
+    
+    num_needed = context.user_data['num_targets_needed']
+    
+    if num_needed == 1 or 'pm' in query.data:
+        context.user_data['use_splitting'] = False
+        context.user_data.setdefault('upload_as', {'photo': False, 'document': False, 'zip': False})
+        return await show_upload_options(update, context)
+
+    if len(selected_targets) < num_needed:
+        targets = await db.get_targets(query.from_user.id)
+        available_targets = [t for t in targets if t['id'] not in selected_targets]
+        keyboard = [[InlineKeyboardButton(t['name'], callback_data=f"multi_target_{t['id']}")] for t in available_targets]
+        await query.edit_message_text(
+            f"Target {len(selected_targets)} of {num_needed} selected. Please select target {len(selected_targets) + 1}:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECT_MULTIPLE_TARGETS
+    else:
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, split uploads", callback_data="split_yes")],
+            [InlineKeyboardButton("❌ No, use first group only", callback_data="split_no")]
+        ]
+        await query.edit_message_text(
+            f"You've selected {len(selected_targets)} targets. Do you want to split the uploads across them (a new group every 180 links)?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSE_SPLIT_OPTION
+
 async def choose_split_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -507,6 +599,28 @@ async def choose_split_option_callback(update: Update, context: ContextTypes.DEF
     context.user_data['use_splitting'] = (choice == 'yes')
     
     context.user_data.setdefault('upload_as', {'photo': False, 'document': False, 'zip': False})
+    return await show_upload_options(update, context)
+
+async def show_upload_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    upload_as = context.user_data['upload_as']
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅' if upload_as['photo'] else '🔲'} As Photos", callback_data="toggle_photo")],
+        [InlineKeyboardButton(f"{'✅' if upload_as['document'] else '🔲'} As Documents", callback_data="toggle_document")],
+        [InlineKeyboardButton(f"{'✅' if upload_as['zip'] else '🔲'} As ZIP Archive", callback_data="toggle_zip")],
+        [InlineKeyboardButton("▶️ Continue", callback_data="confirm_upload_options")],
+        [InlineKeyboardButton("✖️ Cancel", callback_data="cancel_scrape")]
+    ]
+    
+    await query.edit_message_text("Select upload format(s):", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SCRAPE_UPLOAD_AS
+
+async def toggle_upload_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    option = query.data.split('_')[1]
+    context.user_data['upload_as'][option] = not context.user_data['upload_as'][option]
+    await query.answer()
     return await show_upload_options(update, context)
 
 async def confirm_upload_options_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -549,3 +663,122 @@ async def choose_doc_upload_style_callback(update: Update, context: ContextTypes
     await query.edit_message_text("Initializing deep scrape task...")
     await start_deep_scrape(update, context)
     return ConversationHandler.END
+
+async def cancel_scrape_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Operation cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def start_single_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_data = context.user_data
+    url, target_id, upload_as = user_data['url'], user_data['target_id'], user_data['upload_as']
+    
+    await query.edit_message_text(f"🔎 Scraping `{url}`...", parse_mode=ParseMode.MARKDOWN)
+    images = await asyncio.to_thread(scrape_images_from_url_sync, url)
+
+    if not images:
+        await query.edit_message_text("Could not find any images on that page."); return
+
+    await query.edit_message_text(f"Found {len(images)} images. Starting upload to `{target_id}` as {upload_as}s...")
+    
+    for img_url in images:
+        try:
+            if upload_as == 'photo':
+                await context.bot.send_photo(chat_id=target_id, photo=img_url)
+            else:
+                await context.bot.send_document(chat_id=target_id, document=img_url)
+        except Exception as e:
+            logger.warning(f"Failed to send {img_url} to {target_id}: {e}")
+
+    await query.message.reply_text("✅ Single scrape and upload complete!")
+    context.user_data.clear()
+
+async def start_deep_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if update.callback_query:
+        chat_id = update.callback_query.message.chat.id
+    
+    user_data = context.user_data
+    url, target_ids, upload_as, link_range, all_links, use_splitting, doc_upload_style = (
+        user_data['url'], user_data['selected_targets'], user_data['upload_as'], 
+        user_data['link_range'], user_data['all_links'], user_data['use_splitting'],
+        user_data['doc_upload_style']
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Progress", callback_data="refresh_progress")]]
+    msg = await context.bot.send_message(
+        chat_id, 
+        "✅ Deepscrape task has been started in the background. Use /stop to cancel.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    task_id = await db.create_task(
+        update.effective_user.id, url, all_links, target_ids, upload_as, link_range, msg.message_id, use_splitting, doc_upload_style
+    )
+    
+    context.application.create_task(
+        run_deepscrape_task(
+            user_id=update.effective_user.id,
+            task_id=task_id,
+            application=context.application,
+            worker_pool=context.application.bot_data.get("WORKER_BOT_POOL", {})
+        )
+    )
+    context.user_data.clear()
+
+async def refresh_progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("Fetching latest progress...")
+    
+    task = await db.get_user_active_task(query.from_user.id)
+    if not task:
+        await query.edit_message_text("This task has already completed or been stopped.", reply_markup=None)
+        return
+
+    links_to_process = task['all_links']
+    if task['link_range'] != 'all':
+        try:
+            start, end = map(int, task['link_range'].split('-'))
+            links_to_process = links_to_process[start-1:end]
+        except (ValueError, IndexError):
+            pass
+
+    total_links_in_range = len(links_to_process)
+    completed_count = len(task.get('completed_links', []))
+    
+    start_time = task.get('task_start_time')
+    elapsed_time_str = "N/A"
+    eta_str = "N/A"
+    if start_time and completed_count > 0:
+        elapsed_seconds = (datetime.now() - start_time).total_seconds()
+        elapsed_time_str = str(timedelta(seconds=int(elapsed_seconds)))
+        
+        time_per_link = elapsed_seconds / completed_count
+        remaining_links = total_links_in_range - completed_count
+        remaining_seconds = remaining_links * time_per_link
+        eta_str = str(timedelta(seconds=int(remaining_seconds)))
+
+    progress_percent = (completed_count / total_links_in_range * 100) if total_links_in_range > 0 else 0
+    
+    progress_text = (
+        f"📊 **Deepscrape Progress**\n\n"
+        f"Status: `{task['status']}`\n"
+        f"Overall Progress: `{completed_count} / {total_links_in_range}` links ({progress_percent:.2f}%)\n"
+        f"Total Images Uploaded: `{task.get('total_images_uploaded', 0)}`\n"
+        f"Elapsed Time: `{elapsed_time_str}`\n"
+        f"ETA: `{eta_str}`\n\n"
+        f"--- **Current Link** ---\n"
+        f"URL: `{task.get('current_link_url', 'N/A')}`\n"
+        f"Images Found: `{task.get('current_link_images_found', 0)}`\n"
+        f"Images Uploaded: `{task.get('current_link_images_uploaded', 0)}`"
+    )
+
+    keyboard = [[InlineKeyboardButton("🔄 Refresh Progress", callback_data="refresh_progress")]]
+    try:
+        await query.edit_message_text(progress_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.warning(f"Failed to refresh progress: {e}")
