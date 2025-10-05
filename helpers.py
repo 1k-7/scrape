@@ -39,6 +39,20 @@ def get_userbot_client(session_string: str):
         return None
     return TelegramClient(StringSession(session_string), int(API_ID), API_HASH)
 
+def generate_zip_filename(url: str) -> str:
+    """Creates a clean, title-cased filename from a URL."""
+    try:
+        path = urlparse(url).path
+        # Use the last part of the path as the base for the name
+        base_name = path.strip('/').split('/')[-1] or "Scraped Images"
+        # Replace hyphens and underscores with spaces, then title-case it
+        title_cased_name = base_name.replace('-', ' ').replace('_', ' ').title()
+        # Sanitize the filename to remove invalid characters
+        sanitized_name = re.sub(r'[<>:"/\\|?*]', '', title_cased_name)
+        return f"{sanitized_name}.zip"
+    except Exception:
+        return "Scraped_Images.zip"
+
 async def fetch_image(session, url):
     try:
         async with session.get(url, timeout=30) as response:
