@@ -23,13 +23,17 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
         logger.error(f"Task {task_id} not found for user {user_id}.")
         return
 
+    # Load all task settings
     target_groups = task['target_ids']
+    use_splitting = task.get('use_splitting', True)
+    doc_upload_style = task.get('doc_upload_style', 'topics')
     upload_as = task['upload_as']
     link_range = task['link_range']
     status_message_id = task['status_message_id']
     
     worker_bots_data = await db.get_worker_bots(user_id)
-    worker_clients = [worker_pool[w['token']] for w in worker_bots_data if w['token'] in worker_pool]
+    worker_clients = [worker_pool.get(w['token']) for w in worker_bots_data]
+    worker_clients = [bot for bot in worker_clients if bot] # Filter out any missing bots
     if not worker_clients:
         worker_clients.append(application.bot)
 
@@ -60,7 +64,6 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
                 pass
 
         for i, link in enumerate(links_to_process):
-            logger.info(f"Task {task_id}: Starting link {i+1} - {link}")
             await db.update_task_link_progress(task_id, link_url=link, found=0, uploaded=0)
             
             task = await db.tasks_collection.find_one({"_id": task_id})
@@ -68,31 +71,46 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
                 await update_status_message("🛑 Task stopped by user.", reply_markup=None)
                 break
             
-            current_target_index = math.floor(i / 180)
-            if current_target_index >= len(target_groups):
-                await update_status_message("⚠️ Ran out of target groups. Task paused.", reply_markup=None)
-                await db.update_task_status(task_id, "paused")
-                return
-            target_group = target_groups[current_target_index]
+            if use_splitting:
+                current_target_index = math.floor(i / 180)
+                if current_target_index >= len(target_groups):
+                    await update_status_message("⚠️ Ran out of target groups. Task paused.", reply_markup=None)
+                    await db.update_task_status(task_id, "paused")
+                    return
+                target_group = target_groups[current_target_index]
+            else:
+                target_group = target_groups[0]
+
+            try:
+                for bot in worker_clients:
+                    await bot.get_chat(target_group)
+            except Exception as e:
+                logger.error(f"A worker bot could not access channel {target_group}. Skipping link. Error: {e}")
+                await db.complete_link_in_task(task_id, link)
+                continue
 
             images = await asyncio.to_thread(scrape_images_from_url_sync, link)
             await db.update_task_link_progress(task_id, found=len(images))
-
-            task = await db.tasks_collection.find_one({"_id": task_id})
-            if task.get('status') == 'stopped': break
+            
             if not images:
                 await db.complete_link_in_task(task_id, link)
                 continue
-            
-            try:
-                topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
-                created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title, icon_color=0x6FB9F0)
-                topic_id = created_topic.message_thread_id
-                await db.increment_topic_count(task_id)
-            except Exception as e:
-                logger.error(f"Failed to create topic for {link}, skipping link. Error: {e}")
-                await db.complete_link_in_task(task_id, link)
-                continue
+
+            topic_id = None
+            create_topics = (doc_upload_style == 'topics')
+
+            if create_topics:
+                try:
+                    topic_title = (urlparse(link).path.strip('/').replace('/', '-') or urlparse(link).netloc)[:98] or "Scraped Images"
+                    created_topic = await application.bot.create_forum_topic(chat_id=target_group, name=topic_title, icon_color=0x6FB9F0)
+                    topic_id = created_topic.message_thread_id
+                    await db.increment_topic_count(task_id)
+                except Exception as e:
+                    logger.error(f"Failed to create topic for {link}, skipping link. Error: {e}")
+                    await db.complete_link_in_task(task_id, link)
+                    continue
+            else:
+                await application.bot.send_message(target_group, f"--- Files for: `{link}` ---", parse_mode=ParseMode.MARKDOWN)
 
             async def upload_media(bot_client, img_url, format_type):
                 try:
@@ -131,7 +149,8 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
                     try:
                         await application.bot.send_document(
                             target_group, document=zip_file, message_thread_id=topic_id,
-                            filename=f"{topic_title}.zip", caption=f"ZIP archive for {link}"
+                            filename=f"{(urlparse(link).path.strip('/').replace('/', '-') or 'images')}.zip", 
+                            caption=f"ZIP archive for {link}"
                         )
                     except Exception as e:
                          logger.error(f"Failed to upload ZIP for {link}: {e}")
