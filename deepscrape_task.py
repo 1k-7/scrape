@@ -13,7 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database as db
 from scraping import scrape_images_from_url_sync
-from helpers import create_zip_from_urls
+from helpers import create_zip_from_urls, generate_zip_filename
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +147,10 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
                 zip_file = await create_zip_from_urls(list(images))
                 if zip_file:
                     try:
+                        zip_filename = generate_zip_filename(link)
                         await application.bot.send_document(
                             target_group, document=zip_file, message_thread_id=topic_id,
-                            filename=f"{(urlparse(link).path.strip('/').replace('/', '-') or 'images')}.zip", 
+                            filename=zip_filename, 
                             caption=f"ZIP archive for {link}"
                         )
                     except Exception as e:
@@ -167,3 +168,4 @@ async def run_deepscrape_task(user_id, task_id, application: Application, worker
         logger.error(f"CRITICAL ERROR in deepscrape task {task_id}: {e}", exc_info=True)
         await db.update_task_status(task_id, "paused")
         await update_status_message(f"❌ An unexpected error occurred. Task paused.\nError: `{e}`", reply_markup=None, parse_mode=ParseMode.MARKDOWN)
+    
