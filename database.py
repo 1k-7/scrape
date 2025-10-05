@@ -60,7 +60,7 @@ async def get_worker_bots(user_id: int) -> list:
     return (user_data or {}).get("worker_bots", [])
 
 # --- Task Management ---
-async def create_task(user_id: int, base_url: str, all_links: list, target_ids: list, upload_as: dict, link_range: str, status_message_id: int):
+async def create_task(user_id: int, base_url: str, all_links: list, target_ids: list, upload_as: dict, link_range: str, status_message_id: int, use_splitting: bool, doc_upload_style: str):
     task = {
         "user_id": user_id,
         "base_url": base_url,
@@ -69,6 +69,8 @@ async def create_task(user_id: int, base_url: str, all_links: list, target_ids: 
         "all_links": all_links,
         "completed_links": [],
         "target_ids": target_ids,
+        "use_splitting": use_splitting,
+        "doc_upload_style": doc_upload_style,
         "upload_as": upload_as,
         "link_range": link_range,
         "status_message_id": status_message_id,
