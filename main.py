@@ -21,7 +21,7 @@ from handlers import (
     AWAITING_TARGET_ID, CONFIRM_TARGET_DELETE, AWAITING_WORKER_TARGET,
     AWAITING_WORKER_TOKEN, CONFIRM_WORKER_DELETE, SCRAPE_SELECT_TARGET,
     SCRAPE_UPLOAD_AS, SCRAPE_LINK_RANGE, SELECT_WORK_TARGET,
-    SELECT_MULTIPLE_TARGETS,
+    SELECT_MULTIPLE_TARGETS, CHOOSE_SPLIT_OPTION, CHOOSE_DOC_UPLOAD_STYLE,
     start_command, stop_command, main_menu_callback,
     close_menu_callback, ping_callback, login_menu_callback,
     handle_login_session, logout_callback, targets_menu_callback,
@@ -35,7 +35,8 @@ from handlers import (
     scrape_link_range_callback, scrape_all_links_callback, cancel_scrape_callback,
     work_command, select_work_target_callback,
     select_multiple_targets_callback, toggle_upload_option_callback,
-    confirm_upload_options_callback, refresh_progress_callback
+    confirm_upload_options_callback, refresh_progress_callback,
+    choose_split_option_callback, choose_doc_upload_style_callback
 )
 
 # --- Basic Configuration ---
@@ -129,11 +130,13 @@ def main() -> None:
                 CommandHandler("all", scrape_all_links_callback)
             ],
             SELECT_MULTIPLE_TARGETS: [CallbackQueryHandler(select_multiple_targets_callback, pattern=r"^multi_target_")],
+            CHOOSE_SPLIT_OPTION: [CallbackQueryHandler(choose_split_option_callback, pattern=r"^split_")],
             SCRAPE_UPLOAD_AS: [
                 CallbackQueryHandler(scrape_upload_as_callback, pattern=r"^upload_as_"),
                 CallbackQueryHandler(toggle_upload_option_callback, pattern=r"^toggle_"),
                 CallbackQueryHandler(confirm_upload_options_callback, pattern="^confirm_upload_options")
             ],
+            CHOOSE_DOC_UPLOAD_STYLE: [CallbackQueryHandler(choose_doc_upload_style_callback, pattern=r"docstyle_")],
         },
         fallbacks=[
             CommandHandler("stop", stop_command),
