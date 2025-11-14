@@ -1,6 +1,6 @@
 # Dockerfile
 # Use a modern, supported version of Python on Debian "Bookworm"
-FROM python:3.11-slim-bookworm
+FROM python:3.11-bookworm
 
 # Set the working directory in the container
 WORKDIR /app
